@@ -1,3 +1,41 @@
+import * as functions from "firebase-functions/v1";
+import * as admin from "firebase-admin";
+import * as crypto from "node:crypto";
+
+admin.initializeApp();
+
+const db = admin.firestore();
+
+function requireAuth(
+  context: functions.https.CallableContext,
+): string {
+  if (!context.auth) {
+    throw new functions.https.HttpsError(
+      "unauthenticated",
+      "You must be signed in.",
+    );
+  }
+
+  return context.auth.uid;
+}
+
+function isValidString(
+  value: unknown,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0
+  );
+}
+
+function throwInvalid(
+  message: string,
+): never {
+  throw new functions.https.HttpsError(
+    "invalid-argument",
+    message,
+  );
+}
 // ============================================================
 // 8. SOCIAL MEDIA OAUTH / API VERIFICATION
 // ============================================================

@@ -36,12 +36,15 @@ type OAuthStateData = {
   taskId: string;
   state: string;
 
-  // X PKCE
   codeVerifier?: string;
 
   createdAt: admin.firestore.Timestamp;
   expiresAt: admin.firestore.Timestamp;
 };
+
+// ============================================================
+// PLATFORM VALIDATION
+// ============================================================
 
 function requirePlatform(
   value: unknown,
@@ -64,7 +67,7 @@ function requirePlatform(
 }
 
 // ============================================================
-// GENERATE PKCE VALUES
+// PKCE
 // ============================================================
 
 function generatePkceVerifier(): string {
@@ -83,7 +86,7 @@ function generatePkceChallenge(
 }
 
 // ============================================================
-// GET SOCIAL TASK CONFIG
+// GET SOCIAL TASKS
 // ============================================================
 
 export const getSocialTasks =
@@ -232,9 +235,6 @@ export const startSocialOAuth =
           );
         }
 
-        const scopes =
-          "user.info.basic";
-
         const params =
           new URLSearchParams({
             client_key:
@@ -244,7 +244,7 @@ export const startSocialOAuth =
               "code",
 
             scope:
-              scopes,
+              "user.info.basic",
 
             redirect_uri:
               redirectUri,
@@ -278,9 +278,6 @@ export const startSocialOAuth =
           );
         }
 
-        const scopes =
-          "https://www.googleapis.com/auth/youtube.readonly";
-
         const params =
           new URLSearchParams({
             client_id:
@@ -299,7 +296,7 @@ export const startSocialOAuth =
               "consent",
 
             scope:
-              scopes,
+              "https://www.googleapis.com/auth/youtube.readonly",
 
             state,
           });
@@ -425,6 +422,10 @@ export const socialOAuthCallback =
   functions.https.onRequest(
     async (req, res) => {
       try {
+        // ----------------------------------------------------
+        // ONLY GET
+        // ----------------------------------------------------
+
         if (req.method !== "GET") {
           res
             .status(405)
@@ -432,6 +433,10 @@ export const socialOAuthCallback =
 
           return;
         }
+
+        // ----------------------------------------------------
+        // READ QUERY
+        // ----------------------------------------------------
 
         const code =
           typeof req.query.code === "string"
@@ -468,6 +473,10 @@ export const socialOAuthCallback =
           return;
         }
 
+        // ----------------------------------------------------
+        // LOAD STATE
+        // ----------------------------------------------------
+
         const stateRef =
           db
             .collection("oauthStates")
@@ -489,9 +498,9 @@ export const socialOAuthCallback =
         const oauthState =
           stateDoc.data() as OAuthStateData;
 
-        // ====================================================
-        // EXPIRATION CHECK
-        // ====================================================
+        // ----------------------------------------------------
+        // EXPIRATION
+        // ----------------------------------------------------
 
         if (
           !oauthState.expiresAt ||
@@ -516,14 +525,14 @@ export const socialOAuthCallback =
           codeVerifier,
         } = oauthState;
 
-        // ====================================================
-        // ONE-TIME STATE
-        // ====================================================
+        // ----------------------------------------------------
+        // ONE TIME STATE
+        // ----------------------------------------------------
 
         await stateRef.delete();
 
         // ====================================================
-        // X OAUTH 2.0 PKCE
+        // X
         // ====================================================
 
         if (platform === "x") {
@@ -553,6 +562,10 @@ export const socialOAuthCallback =
                 `${clientId}:${clientSecret}`,
               )
               .toString("base64");
+
+          // --------------------------------------------------
+          // TOKEN
+          // --------------------------------------------------
 
           const tokenResponse =
             await fetch(
@@ -610,9 +623,9 @@ export const socialOAuthCallback =
             );
           }
 
-          // -----------------------------------------------
-          // GET AUTHENTICATED X USER
-          // -----------------------------------------------
+          // --------------------------------------------------
+          // USER
+          // --------------------------------------------------
 
           const meResponse =
             await fetch(
@@ -648,9 +661,9 @@ export const socialOAuthCallback =
             );
           }
 
-          // -----------------------------------------------
-          // STORE NON-SECRET ACCOUNT DATA
-          // -----------------------------------------------
+          // --------------------------------------------------
+          // SAVE ACCOUNT
+          // --------------------------------------------------
 
           await db
             .collection("users")
@@ -679,9 +692,9 @@ export const socialOAuthCallback =
               },
             );
 
-          // -----------------------------------------------
-          // VERIFY FOLLOW
-          // -----------------------------------------------
+          // --------------------------------------------------
+          // LOAD X CONFIG
+          // --------------------------------------------------
 
           const configDoc =
             await db
@@ -700,6 +713,10 @@ export const socialOAuthCallback =
               "X targetUserId is not configured.",
             );
           }
+
+          // --------------------------------------------------
+          // CHECK FOLLOW
+          // --------------------------------------------------
 
           const followingUrl =
             new URL(
@@ -754,6 +771,10 @@ export const socialOAuthCallback =
 
             return;
           }
+
+          // --------------------------------------------------
+          // VERIFIED
+          // --------------------------------------------------
 
           await createSocialVerification(
             uid,
@@ -848,7 +869,6 @@ export const socialOAuthCallback =
             );
           }
 
-          // Save public account identity only.
           await db
             .collection("users")
             .doc(uid)
@@ -877,15 +897,10 @@ export const socialOAuthCallback =
               },
             );
 
-          /*
-           * IMPORTANT:
-           *
-           * TikTok Login Kit proves authorization/login.
-           * It does NOT by itself prove the user followed
-           * Power Fan Network.
-           *
-           * Therefore NO reward is granted here.
-           */
+          // IMPORTANT:
+          // TikTok authorization alone does not prove
+          // that the user followed Power Fan Network.
+          // Therefore NO reward is granted here.
         }
 
         // ====================================================
@@ -911,6 +926,10 @@ export const socialOAuthCallback =
               "Google OAuth configuration is incomplete.",
             );
           }
+
+          // --------------------------------------------------
+          // GOOGLE TOKEN
+          // --------------------------------------------------
 
           const tokenResponse =
             await fetch(
@@ -943,6 +962,14 @@ export const socialOAuthCallback =
             );
 
           if (!tokenResponse.ok) {
+            const body =
+              await tokenResponse.text();
+
+            console.error(
+              "Google token error:",
+              body,
+            );
+
             throw new Error(
               "Google token exchange failed.",
             );
@@ -959,9 +986,9 @@ export const socialOAuthCallback =
             );
           }
 
-          // -----------------------------------------------
-          // TARGET CHANNEL
-          // -----------------------------------------------
+          // --------------------------------------------------
+          // LOAD YOUTUBE CONFIG
+          // --------------------------------------------------
 
           const configDoc =
             await db
@@ -981,9 +1008,9 @@ export const socialOAuthCallback =
             );
           }
 
-          // -----------------------------------------------
+          // --------------------------------------------------
           // CHECK SUBSCRIPTION
-          // -----------------------------------------------
+          // --------------------------------------------------
 
           const subscriptionsUrl =
             new URL(
@@ -1017,6 +1044,14 @@ export const socialOAuthCallback =
             );
 
           if (!subscriptionResponse.ok) {
+            const body =
+              await subscriptionResponse.text();
+
+            console.error(
+              "YouTube API error:",
+              body,
+            );
+
             throw new Error(
               "YouTube subscription API failed.",
             );
@@ -1069,18 +1104,9 @@ export const socialOAuthCallback =
           platform === "facebook" ||
           platform === "instagram"
         ) {
-          /*
-           * OAuth authorization alone is NOT considered
-           * proof that the user followed/liked the Power Fan
-           * Network account.
-           *
-           * We record the connection only.
-           *
-           * Reward remains UNVERIFIED.
-           *
-           * This prevents fake rewards caused by treating
-           * login as follow verification.
-           */
+          // OAuth connection only.
+          // It does NOT prove follow/like.
+          // Therefore NO reward is created.
 
           await db
             .collection("users")
@@ -1102,6 +1128,10 @@ export const socialOAuthCallback =
               },
             );
         }
+
+        // ----------------------------------------------------
+        // SUCCESS
+        // ----------------------------------------------------
 
         res
           .status(200)
@@ -1137,6 +1167,10 @@ async function createSocialVerification(
   platform: SocialPlatform,
   evidenceId: string,
 ): Promise<void> {
+  // ----------------------------------------------------------
+  // LOAD CONFIG
+  // ----------------------------------------------------------
+
   const configDoc =
     await db
       .collection("config")
@@ -1162,6 +1196,10 @@ async function createSocialVerification(
     );
   }
 
+  // ----------------------------------------------------------
+  // USER
+  // ----------------------------------------------------------
+
   const userRef =
     db
       .collection("users")
@@ -1171,6 +1209,10 @@ async function createSocialVerification(
     userRef
       .collection("taskVerifications")
       .doc(taskId);
+
+  // ----------------------------------------------------------
+  // PREVENT DUPLICATE
+  // ----------------------------------------------------------
 
   const existing =
     await verificationRef.get();
@@ -1183,8 +1225,16 @@ async function createSocialVerification(
     return;
   }
 
+  // ----------------------------------------------------------
+  // VERIFICATION ID
+  // ----------------------------------------------------------
+
   const verificationId =
     crypto.randomUUID();
+
+  // ----------------------------------------------------------
+  // SAVE
+  // ----------------------------------------------------------
 
   await verificationRef.set(
     {
@@ -1223,7 +1273,7 @@ async function createSocialVerification(
 // ============================================================
 //
 // Telegram Bot API verifies actual membership.
-// The client cannot mark itself as verified.
+// Flutter cannot mark itself as verified.
 // ============================================================
 
 export const verifyTelegramMembership =
@@ -1232,10 +1282,17 @@ export const verifyTelegramMembership =
       enforceAppCheck: true,
     })
     .https.onCall(async (data, context) => {
-      const uid = requireAuth(context);
+      const uid =
+        requireAuth(context);
+
+      // ------------------------------------------------------
+      // TASK ID
+      // ------------------------------------------------------
 
       if (
-        !isValidString(data?.taskId)
+        !isValidString(
+          data?.taskId,
+        )
       ) {
         throwInvalid(
           "taskId is required.",
@@ -1244,6 +1301,10 @@ export const verifyTelegramMembership =
 
       const taskId =
         data.taskId.trim();
+
+      // ------------------------------------------------------
+      // TELEGRAM USER ID
+      // ------------------------------------------------------
 
       const telegramUserId =
         String(
@@ -1256,6 +1317,10 @@ export const verifyTelegramMembership =
         );
       }
 
+      // ------------------------------------------------------
+      // BOT TOKEN
+      // ------------------------------------------------------
+
       const botToken =
         process.env.TELEGRAM_BOT_TOKEN;
 
@@ -1265,6 +1330,10 @@ export const verifyTelegramMembership =
           "Telegram bot is not configured.",
         );
       }
+
+      // ------------------------------------------------------
+      // CONFIG
+      // ------------------------------------------------------
 
       const configDoc =
         await db
@@ -1284,6 +1353,10 @@ export const verifyTelegramMembership =
           "Telegram chatId is not configured.",
         );
       }
+
+      // ------------------------------------------------------
+      // TELEGRAM API
+      // ------------------------------------------------------
 
       const response =
         await fetch(
@@ -1314,6 +1387,10 @@ export const verifyTelegramMembership =
         );
       }
 
+      // ------------------------------------------------------
+      // RESPONSE
+      // ------------------------------------------------------
+
       const result =
         await response.json() as {
           ok?: boolean;
@@ -1333,6 +1410,10 @@ export const verifyTelegramMembership =
       const status =
         result.result?.status;
 
+      // ------------------------------------------------------
+      // MEMBERSHIP
+      // ------------------------------------------------------
+
       const isMember =
         status === "member" ||
         status === "administrator" ||
@@ -1344,6 +1425,10 @@ export const verifyTelegramMembership =
           "Telegram membership not verified.",
         );
       }
+
+      // ------------------------------------------------------
+      // VERIFIED
+      // ------------------------------------------------------
 
       await createSocialVerification(
         uid,

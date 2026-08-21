@@ -1,0 +1,48 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    match /users/{userId} {
+      // User can READ their own document
+      allow read: if isOwner(userId);
+      
+      // User CANNOT update sensitive fields like fanBalance, kycLevel, referralCount directly
+      allow update: if isOwner(userId) 
+        && !request.resource.data.diff(resource.data).affectedKeys()
+           .hasAny(['fanBalance', 'afamBalance', 'kycLevel', 'referralCount']);
+      
+      // Initial user creation
+      allow create: if isAuthenticated();
+
+      // Sub-collections protection
+      match /transactions/{txId} {
+        allow read: if isOwner(userId);
+        allow write: if false; // Only Cloud Functions can write transactions
+      }
+
+      match /miningSessions/{sessionId} {
+        allow read: if isOwner(userId);
+        allow write: if false; // Handled by backend Cloud Functions
+      }
+
+      match /dailyTasks/{taskId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+
+      match /kyc/{kycRecord} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+    }
+  }
+}

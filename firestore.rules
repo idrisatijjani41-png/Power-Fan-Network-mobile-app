@@ -3,66 +3,211 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // ============================================================
+    // HELPERS
+    // ============================================================
+
     function isAuthenticated() {
       return request.auth != null;
     }
 
     function isOwner(userId) {
-      return isAuthenticated() && request.auth.uid == userId;
+      return isAuthenticated()
+        && request.auth.uid == userId;
     }
+
+    // ============================================================
+    // USER ACCOUNT
+    // ============================================================
 
     match /users/{userId} {
 
-      // User can only create their own account document.
-      // Sensitive/reward fields cannot be supplied by the client.
+      // User can create ONLY their own account.
+      // Sensitive/reward fields must NOT come from the client.
       allow create: if isOwner(userId)
         && !request.resource.data.keys().hasAny([
           'fanBalance',
           'afamBalance',
           'kycLevel',
-          'referralCount'
+          'referralCount',
+          'totalRewards',
+          'totalAdRewards',
+          'totalTaskRewards',
+          'totalSocialRewards',
+          'totalMiningRewards'
         ]);
 
-      // User can only read their own account.
+      // User can read only their own account.
       allow read: if isOwner(userId);
 
-      // User can update their own account,
-      // but cannot directly modify sensitive fields.
+      // User can update normal profile fields,
+      // but NEVER financial/reward/security fields.
       allow update: if isOwner(userId)
         && !request.resource.data.diff(resource.data).affectedKeys()
           .hasAny([
             'fanBalance',
             'afamBalance',
             'kycLevel',
-            'referralCount'
+            'referralCount',
+            'totalRewards',
+            'totalAdRewards',
+            'totalTaskRewards',
+            'totalSocialRewards',
+            'totalMiningRewards',
+            'isVerified',
+            'isAdmin',
+            'role',
+            'accountStatus',
+            'suspended',
+            'banReason'
           ]);
 
-      // User cannot delete their account directly.
+      // Client cannot delete account directly.
       allow delete: if false;
 
-      // Transactions
-      match /transactions/{txId} {
+      // ==========================================================
+      // TRANSACTIONS
+      // ==========================================================
+
+      match /transactions/{transactionId} {
+
+        // User can view their own transaction history.
         allow read: if isOwner(userId);
-        allow write: if false;
+
+        // Client can NEVER create/edit/delete transactions.
+        // Backend/Cloud Functions must handle this.
+        allow create, update, delete: if false;
       }
 
-      // Mining sessions
+      // ==========================================================
+      // MINING SESSIONS
+      // ==========================================================
+
       match /miningSessions/{sessionId} {
+
         allow read: if isOwner(userId);
-        allow write: if false;
+
+        // Mining start/stop/reward must be controlled by backend.
+        allow create, update, delete: if false;
       }
 
-      // Daily tasks
+      // ==========================================================
+      // DAILY TASKS
+      // ==========================================================
+
       match /dailyTasks/{taskId} {
+
         allow read: if isOwner(userId);
-        allow write: if false;
+
+        // Client cannot mark task as completed directly.
+        allow create, update, delete: if false;
       }
 
+      // ==========================================================
       // KYC
-      match /kyc/{kycRecord} {
+      // ==========================================================
+
+      match /kyc/{kycRecordId} {
+
         allow read: if isOwner(userId);
-        allow write: if false;
+
+        // KYC verification must be backend/admin controlled.
+        allow create, update, delete: if false;
       }
+
+      // ==========================================================
+      // AD REWARD CLAIMS
+      // ==========================================================
+
+      match /adClaims/{claimId} {
+
+        allow read: if isOwner(userId);
+
+        // Client cannot directly create a rewarded claim.
+        // Cloud Functions creates/verifies the claim.
+        allow create, update, delete: if false;
+      }
+
+      // ==========================================================
+      // SOCIAL MEDIA REWARD CLAIMS
+      // ==========================================================
+
+      match /socialClaims/{claimId} {
+
+        allow read: if isOwner(userId);
+
+        // Social verification must happen on backend.
+        allow create, update, delete: if false;
+      }
+
+      // ==========================================================
+      // TASK REWARD CLAIMS
+      // ==========================================================
+
+      match /taskClaims/{claimId} {
+
+        allow read: if isOwner(userId);
+
+        // Backend verifies completion and issues reward.
+        allow create, update, delete: if false;
+      }
+
+      // ==========================================================
+      // REWARD HISTORY
+      // ==========================================================
+
+      match /rewardHistory/{rewardId} {
+
+        allow read: if isOwner(userId);
+
+        // User must never create their own reward history.
+        allow create, update, delete: if false;
+      }
+    }
+
+    // ============================================================
+    // GLOBAL TASK DEFINITIONS
+    // ============================================================
+
+    match /tasks/{taskId} {
+
+      // Tasks can be publicly readable by authenticated users.
+      allow read: if isAuthenticated();
+
+      // Client cannot create/change tasks.
+      allow create, update, delete: if false;
+    }
+
+    // ============================================================
+    // SOCIAL TASK DEFINITIONS
+    // ============================================================
+
+    match /socialTasks/{taskId} {
+
+      allow read: if isAuthenticated();
+
+      // Only backend/admin can modify social tasks.
+      allow create, update, delete: if false;
+    }
+
+    // ============================================================
+    // AD CONFIGURATION
+    // ============================================================
+
+    match /adConfig/{configId} {
+
+      allow read: if isAuthenticated();
+
+      // Client cannot change ad reward configuration.
+      allow create, update, delete: if false;
+    }
+
+    // ============================================================
+    // DEFAULT DENY
+    // ============================================================
+
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 }

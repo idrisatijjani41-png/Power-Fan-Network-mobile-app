@@ -1,1009 +1,583 @@
-import * as functions from "firebase-functions";
-import * as admin from "firebase-admin";
-import * as crypto from "crypto";
-
-admin.initializeApp();
-
-const db = admin.firestore();
-
-/*
- * ============================================================
- * POWER FAN NETWORK - SERVER AUTHORITATIVE REWARD SYSTEM
- * ============================================================
- *
- * IMPORTANT:
- * - Client NEVER writes balances.
- * - Client NEVER creates reward transactions.
- * - Client NEVER confirms its own task.
- * - Rewards are granted only by trusted backend logic.
- * - Ad rewards use AdMob Server-Side Verification (SSV).
- * - Social rewards require a trusted verification record.
- */
-
 // ============================================================
-// SECURITY / CONFIG
+// 8. SOCIAL MEDIA OAUTH / API VERIFICATION
 // ============================================================
-
-const MAX_ADS_PER_DAY = 7;
-
-const MINING_DURATION_MS = 24 * 60 * 60 * 1000;
-
-// Keep these values server-side.
-// Change them to the actual economics of the app.
-const MINING_BASE_RATE = 0.2;
-const MINING_BOOST_RATE = 0.2;
-
-// ============================================================
-// COMMON HELPERS
+//
+// IMPORTANT:
+// - OAuth secrets stay on the server.
+// - Flutter never receives client secrets.
+// - OAuth state prevents CSRF.
+// - A social reward is created ONLY after backend verification.
+// - Never trust "I followed" from Flutter.
+//
+// Supported architecture:
+//   X
+//   Instagram / Meta
+//   Facebook
+//   TikTok
+//   YouTube
+//   Telegram
+//
+// IMPORTANT:
+// Not every platform exposes an API that allows us to verify
+// every possible social action. We only grant rewards where
+// the official API provides sufficient evidence.
 // ============================================================
 
-function requireAuth(
-  context: functions.https.CallableContext,
-): string {
-  if (!context.auth) {
+type SocialPlatform =
+  | "x"
+  | "instagram"
+  | "facebook"
+  | "tiktok"
+  | "youtube"
+  | "telegram";
+
+type OAuthStateData = {
+  uid: string;
+  platform: SocialPlatform;
+  taskId: string;
+  state: string;
+  createdAt: admin.firestore.Timestamp;
+  expiresAt: admin.firestore.Timestamp;
+};
+
+function requirePlatform(
+  value: unknown,
+): SocialPlatform {
+  if (
+    value !== "x" &&
+    value !== "instagram" &&
+    value !== "facebook" &&
+    value !== "tiktok" &&
+    value !== "youtube" &&
+    value !== "telegram"
+  ) {
     throw new functions.https.HttpsError(
-      "unauthenticated",
-      "Authentication is required.",
+      "invalid-argument",
+      "Unsupported social platform.",
     );
   }
 
-  return context.auth.uid;
+  return value;
 }
 
-function isValidString(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
-}
+// ------------------------------------------------------------
+// SOCIAL CONFIG
+// ------------------------------------------------------------
+//
+// Put public task configuration in:
+//
+// /config/socialTasks
+//
+// Example:
+// {
+//   x: {
+//     enabled: true,
+//     url: "https://x.com/YOUR_ACCOUNT",
+//     reward: 50,
+//     targetUserId: "..."
+//   }
+// }
+//
+// NEVER put client secrets here.
+// ------------------------------------------------------------
 
-function dayKey(): string {
-  const now = new Date();
-
-  return now.toISOString().slice(0, 10);
-}
-
-function throwInvalid(message: string): never {
-  throw new functions.https.HttpsError(
-    "invalid-argument",
-    message,
-  );
-}
-
-// ============================================================
-// 1. START MINING SESSION
-// ============================================================
-
-export const startMiningSession =
+export const getSocialTasks =
   functions
     .runWith({
       enforceAppCheck: true,
     })
     .https.onCall(async (data, context) => {
-      const uid = requireAuth(context);
+      requireAuth(context);
 
-      const userRef = db.collection("users").doc(uid);
+      const configRef = db
+        .collection("config")
+        .doc("socialTasks");
 
-      const sessionRef = userRef
-        .collection("miningSessions")
-        .doc("active");
+      const configDoc =
+        await configRef.get();
 
-      return db.runTransaction(async (transaction) => {
-        const userDoc = await transaction.get(userRef);
-
-        if (!userDoc.exists) {
-          throw new functions.https.HttpsError(
-            "not-found",
-            "User account does not exist.",
-          );
-        }
-
-        const existingSession =
-          await transaction.get(sessionRef);
-
-        const now = admin.firestore.Timestamp.now();
-
-        if (existingSession.exists) {
-          const session = existingSession.data();
-
-          if (
-            session &&
-            session.sessionEnd &&
-            session.sessionEnd.toMillis() > now.toMillis() &&
-            session.status === "ACTIVE"
-          ) {
-            throw new functions.https.HttpsError(
-              "already-exists",
-              "An active mining session already exists.",
-            );
-          }
-        }
-
-        const sessionStart = now;
-
-        const sessionEnd =
-          admin.firestore.Timestamp.fromMillis(
-            sessionStart.toMillis() +
-              MINING_DURATION_MS,
-          );
-
-        const sessionData = {
-          uid,
-          sessionStart,
-          sessionEnd,
-
-          // Server authoritative values.
-          baseRate: MINING_BASE_RATE,
-          boostRate: MINING_BOOST_RATE,
-          totalRate:
-            MINING_BASE_RATE +
-            MINING_BOOST_RATE,
-
-          accumulatedReward: 0,
-
-          status: "ACTIVE",
-
-          createdAt:
-            admin.firestore.FieldValue.serverTimestamp(),
-
-          updatedAt:
-            admin.firestore.FieldValue.serverTimestamp(),
-        };
-
-        transaction.set(
-          sessionRef,
-          sessionData,
-        );
-
+      if (!configDoc.exists) {
         return {
           status: "SUCCESS",
-          sessionStart:
-            sessionStart.toMillis(),
-          sessionEnd:
-            sessionEnd.toMillis(),
+          tasks: {},
         };
-      });
-    });
-
-// ============================================================
-// 2. CLAIM / FINALIZE MINING REWARD
-// ============================================================
-
-export const claimMiningReward =
-  functions
-    .runWith({
-      enforceAppCheck: true,
-    })
-    .https.onCall(async (data, context) => {
-      const uid = requireAuth(context);
-
-      const userRef =
-        db.collection("users").doc(uid);
-
-      const sessionRef =
-        userRef
-          .collection("miningSessions")
-          .doc("active");
-
-      return db.runTransaction(async (transaction) => {
-        const sessionDoc =
-          await transaction.get(sessionRef);
-
-        if (!sessionDoc.exists) {
-          throw new functions.https.HttpsError(
-            "not-found",
-            "No mining session found.",
-          );
-        }
-
-        const session =
-          sessionDoc.data();
-
-        if (!session) {
-          throw new functions.https.HttpsError(
-            "internal",
-            "Invalid mining session.",
-          );
-        }
-
-        if (session.status !== "ACTIVE") {
-          throw new functions.https.HttpsError(
-            "failed-precondition",
-            "Mining session is not active.",
-          );
-        }
-
-        const now =
-          admin.firestore.Timestamp.now();
-
-        const endTime =
-          session.sessionEnd;
-
-        if (!endTime) {
-          throw new functions.https.HttpsError(
-            "internal",
-            "Mining session has no end time.",
-          );
-        }
-
-        // User cannot claim before 24 hours.
-        if (
-          now.toMillis() <
-          endTime.toMillis()
-        ) {
-          throw new functions.https.HttpsError(
-            "failed-precondition",
-            "Mining session has not finished yet.",
-          );
-        }
-
-        const baseRate =
-          Number(session.baseRate) || 0;
-
-        const boostRate =
-          Number(session.boostRate) || 0;
-
-        const totalRate =
-          baseRate + boostRate;
-
-        /*
-         * Reward is calculated by the server.
-         *
-         * This is deliberately NOT accepted from
-         * the Flutter client.
-         */
-        const reward =
-          Number(
-            (totalRate * 24).toFixed(8),
-          );
-
-        if (
-          !Number.isFinite(reward) ||
-          reward <= 0
-        ) {
-          throw new functions.https.HttpsError(
-            "internal",
-            "Invalid mining reward.",
-          );
-        }
-
-        const userDoc =
-          await transaction.get(userRef);
-
-        if (!userDoc.exists) {
-          throw new functions.https.HttpsError(
-            "not-found",
-            "User account not found.",
-          );
-        }
-
-        const transactionRef =
-          userRef
-            .collection("transactions")
-            .doc();
-
-        // ONE atomic transaction:
-        // balance + transaction + session completion.
-        transaction.update(userRef, {
-          fanBalance:
-            admin.firestore.FieldValue.increment(
-              reward,
-            ),
-
-          totalMiningRewards:
-            admin.firestore.FieldValue.increment(
-              reward,
-            ),
-
-          updatedAt:
-            admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        transaction.set(
-          transactionRef,
-          {
-            type: "MINING_REWARD",
-            amount: reward,
-            currency: "FAN",
-
-            sessionId: "active",
-
-            status: "SUCCESS",
-
-            createdAt:
-              admin.firestore.FieldValue.serverTimestamp(),
-          },
-        );
-
-        transaction.update(
-          sessionRef,
-          {
-            status: "COMPLETED",
-
-            accumulatedReward:
-              reward,
-
-            completedAt:
-              admin.firestore.FieldValue.serverTimestamp(),
-
-            updatedAt:
-              admin.firestore.FieldValue.serverTimestamp(),
-          },
-        );
-
-        return {
-          status: "SUCCESS",
-          rewardGranted: reward,
-        };
-      });
-    });
-
-// ============================================================
-// 3. CREATE AD SESSION
-// ============================================================
-//
-// The app requests a server-generated nonce BEFORE showing
-// a rewarded ad.
-//
-// The nonce is later sent to AdMob as custom_data.
-//
-// This prevents the client from simply saying:
-// "I watched an ad."
-// ============================================================
-
-export const createAdSession =
-  functions
-    .runWith({
-      enforceAppCheck: true,
-    })
-    .https.onCall(async (data, context) => {
-      const uid = requireAuth(context);
-
-      const nonce = crypto
-        .randomBytes(32)
-        .toString("hex");
-
-      const ref = db
-        .collection("users")
-        .doc(uid)
-        .collection("adSessions")
-        .doc(nonce);
-
-      await ref.set({
-        uid,
-        nonce,
-
-        status: "PENDING",
-
-        createdAt:
-          admin.firestore.FieldValue.serverTimestamp(),
-      });
+      }
 
       return {
         status: "SUCCESS",
-        nonce,
+        tasks: configDoc.data() || {},
       };
     });
 
 // ============================================================
-// 4. ADMOB SERVER-SIDE VERIFICATION
-// ============================================================
-//
-// AdMob calls this HTTP endpoint directly.
-//
-// NEVER call this from Flutter.
-//
-// The callback signature is verified using Google's
-// AdMob public verification keys.
+// 9. CREATE SOCIAL OAUTH SESSION
 // ============================================================
 
-const ADMOB_KEYS_URL =
-  "https://gstatic.com/admob/reward/verifier-keys.json";
+export const startSocialOAuth =
+  functions
+    .runWith({
+      enforceAppCheck: true,
+    })
+    .https.onCall(async (data, context) => {
+      const uid = requireAuth(context);
 
-type AdMobKey = {
-  keyId: number;
-  pem: string;
-};
+      const platform =
+        requirePlatform(
+          data?.platform,
+        );
 
-let cachedAdMobKeys:
-  Map<number, crypto.KeyObject> | null = null;
-
-let cachedKeysAt = 0;
-
-async function getAdMobKeys(
-  forceRefresh = false,
-): Promise<Map<number, crypto.KeyObject>> {
-  const now = Date.now();
-
-  // Google says cached public keys should not be
-  // cached for more than 24 hours.
-  if (
-    !forceRefresh &&
-    cachedAdMobKeys &&
-    now - cachedKeysAt <
-      23 * 60 * 60 * 1000
-  ) {
-    return cachedAdMobKeys;
-  }
-
-  const response =
-    await fetch(ADMOB_KEYS_URL);
-
-  if (!response.ok) {
-    throw new Error(
-      "Unable to download AdMob verification keys.",
-    );
-  }
-
-  const json =
-    (await response.json()) as {
-      keys?: AdMobKey[];
-    };
-
-  if (
-    !json.keys ||
-    !Array.isArray(json.keys) ||
-    json.keys.length === 0
-  ) {
-    throw new Error(
-      "AdMob verification keys are empty.",
-    );
-  }
-
-  const map =
-    new Map<number, crypto.KeyObject>();
-
-  for (const key of json.keys) {
-    if (
-      !key ||
-      typeof key.keyId !== "number" ||
-      typeof key.pem !== "string"
-    ) {
-      continue;
-    }
-
-    try {
-      map.set(
-        key.keyId,
-        crypto.createPublicKey(
-          key.pem,
-        ),
-      );
-    } catch {
-      // Ignore malformed key.
-    }
-  }
-
-  if (map.size === 0) {
-    throw new Error(
-      "No valid AdMob public keys found.",
-    );
-  }
-
-  cachedAdMobKeys = map;
-  cachedKeysAt = now;
-
-  return map;
-}
-
-// ============================================================
-// VERIFY ADMOB SIGNATURE
-// ============================================================
-
-async function verifyAdMobCallback(
-  req: functions.https.Request,
-): Promise<{
-  valid: boolean;
-  transactionId: string;
-  userId: string;
-  rewardAmount: number;
-  rewardItem: string;
-  adUnit: string;
-  customData: string;
-}> {
-  const rawUrl =
-    req.originalUrl || req.url;
-
-  const questionIndex =
-    rawUrl.indexOf("?");
-
-  if (questionIndex < 0) {
-    throw new Error(
-      "Missing query string.",
-    );
-  }
-
-  const queryString =
-    rawUrl.substring(
-      questionIndex + 1,
-    );
-
-  const signatureMarker =
-    "&signature=";
-
-  const signatureIndex =
-    queryString.indexOf(
-      signatureMarker,
-    );
-
-  if (signatureIndex < 0) {
-    throw new Error(
-      "Missing AdMob signature.",
-    );
-  }
-
-  /*
-   * IMPORTANT:
-   * Do not rebuild or reorder the query string.
-   *
-   * Google signs the original content before
-   * &signature= and &key_id=.
-   */
-  const signedContent =
-    queryString.substring(
-      0,
-      signatureIndex,
-    );
-
-  const afterSignature =
-    queryString.substring(
-      signatureIndex +
-        signatureMarker.length,
-    );
-
-  const keyMarker =
-    "&key_id=";
-
-  const keyIndex =
-    afterSignature.indexOf(
-      keyMarker,
-    );
-
-  if (keyIndex < 0) {
-    throw new Error(
-      "Missing AdMob key_id.",
-    );
-  }
-
-  const signatureText =
-    afterSignature.substring(
-      0,
-      keyIndex,
-    );
-
-  const keyIdText =
-    afterSignature.substring(
-      keyIndex +
-        keyMarker.length,
-    );
-
-  const keyId =
-    Number(keyIdText);
-
-  if (
-    !Number.isSafeInteger(keyId)
-  ) {
-    throw new Error(
-      "Invalid AdMob key_id.",
-    );
-  }
-
-  const signature =
-    Buffer.from(
-      signatureText,
-      "base64url",
-    );
-
-  let keys =
-    await getAdMobKeys();
-
-  let publicKey =
-    keys.get(keyId);
-
-  // Refresh once if Google rotated keys.
-  if (!publicKey) {
-    keys =
-      await getAdMobKeys(true);
-
-    publicKey =
-      keys.get(keyId);
-  }
-
-  if (!publicKey) {
-    throw new Error(
-      "Unknown AdMob verification key.",
-    );
-  }
-
-  const verifier =
-    crypto.createVerify(
-      "SHA256",
-    );
-
-  verifier.update(
-    Buffer.from(
-      signedContent,
-      "utf8",
-    ),
-  );
-
-  verifier.end();
-
-  const valid =
-    verifier.verify(
-      {
-        key: publicKey,
-        dsaEncoding: "der",
-      },
-      signature,
-    );
-
-  if (!valid) {
-    throw new Error(
-      "Invalid AdMob signature.",
-    );
-  }
-
-  // Parse values ONLY after signature verification.
-  const params =
-    new URLSearchParams(
-      queryString,
-    );
-
-  const transactionId =
-    params.get(
-      "transaction_id",
-    );
-
-  const userId =
-    params.get("user_id");
-
-  const rewardAmountText =
-    params.get("reward_amount");
-
-  const rewardItem =
-    params.get("reward_item");
-
-  const adUnit =
-    params.get("ad_unit");
-
-  const customData =
-    params.get("custom_data");
-
-  if (
-    !transactionId ||
-    !userId ||
-    !rewardAmountText ||
-    !rewardItem ||
-    !adUnit ||
-    !customData
-  ) {
-    throw new Error(
-      "Incomplete AdMob SSV callback.",
-    );
-  }
-
-  const rewardAmount =
-    Number(rewardAmountText);
-
-  if (
-    !Number.isFinite(rewardAmount) ||
-    rewardAmount <= 0
-  ) {
-    throw new Error(
-      "Invalid reward amount.",
-    );
-  }
-
-  return {
-    valid: true,
-    transactionId,
-    userId,
-    rewardAmount,
-    rewardItem,
-    adUnit,
-    customData,
-  };
-}
-
-// ============================================================
-// 5. GRANT VERIFIED ADMOB REWARD
-// ============================================================
-
-export const admobRewardSsv =
-  functions.https.onRequest(
-    async (req, res) => {
-      if (req.method !== "GET") {
-        res.status(405).send("Method Not Allowed");
-        return;
+      if (
+        !isValidString(data?.taskId)
+      ) {
+        throwInvalid(
+          "taskId is required.",
+        );
       }
 
-      try {
-        const verification =
-          await verifyAdMobCallback(req);
+      const taskId =
+        data.taskId.trim();
 
-        if (!verification.valid) {
-          res.status(401).send("Invalid");
+      const state =
+        crypto.randomBytes(32).toString("hex");
+
+      const now =
+        admin.firestore.Timestamp.now();
+
+      const expiresAt =
+        admin.firestore.Timestamp.fromMillis(
+          Date.now() + 10 * 60 * 1000,
+        );
+
+      const stateRef =
+        db
+          .collection("oauthStates")
+          .doc(state);
+
+      const stateData: OAuthStateData = {
+        uid,
+        platform,
+        taskId,
+        state,
+        createdAt: now,
+        expiresAt,
+      };
+
+      await stateRef.set(stateData);
+
+      let authorizationUrl = "";
+
+      // ------------------------------------------------------
+      // X
+      // ------------------------------------------------------
+
+      if (platform === "x") {
+        const clientId =
+          process.env.X_CLIENT_ID;
+
+        if (!clientId) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "X OAuth is not configured.",
+          );
+        }
+
+        const redirectUri =
+          process.env.X_REDIRECT_URI;
+
+        if (!redirectUri) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "X redirect URI is not configured.",
+          );
+        }
+
+        const scopes = [
+          "users.read",
+          "tweet.read",
+          "follows.read",
+          "offline.access",
+        ].join(" ");
+
+        const params =
+          new URLSearchParams({
+            response_type: "code",
+            client_id: clientId,
+            redirect_uri: redirectUri,
+            scope: scopes,
+            state,
+          });
+
+        authorizationUrl =
+          "https://twitter.com/i/oauth2/authorize?" +
+          params.toString();
+      }
+
+      // ------------------------------------------------------
+      // TIKTOK
+      // ------------------------------------------------------
+
+      if (platform === "tiktok") {
+        const clientKey =
+          process.env.TIKTOK_CLIENT_KEY;
+
+        const redirectUri =
+          process.env.TIKTOK_REDIRECT_URI;
+
+        if (
+          !clientKey ||
+          !redirectUri
+        ) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "TikTok OAuth is not configured.",
+          );
+        }
+
+        const params =
+          new URLSearchParams({
+            client_key: clientKey,
+            response_type: "code",
+            scope: "user.info.basic",
+            redirect_uri: redirectUri,
+            state,
+          });
+
+        authorizationUrl =
+          "https://www.tiktok.com/v2/auth/authorize/?" +
+          params.toString();
+      }
+
+      // ------------------------------------------------------
+      // YOUTUBE / GOOGLE
+      // ------------------------------------------------------
+
+      if (platform === "youtube") {
+        const clientId =
+          process.env.GOOGLE_CLIENT_ID;
+
+        const redirectUri =
+          process.env.GOOGLE_REDIRECT_URI;
+
+        if (
+          !clientId ||
+          !redirectUri
+        ) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Google OAuth is not configured.",
+          );
+        }
+
+        const scope =
+          "https://www.googleapis.com/auth/youtube.readonly";
+
+        const params =
+          new URLSearchParams({
+            client_id: clientId,
+            redirect_uri: redirectUri,
+            response_type: "code",
+            access_type: "offline",
+            prompt: "consent",
+            scope,
+            state,
+          });
+
+        authorizationUrl =
+          "https://accounts.google.com/o/oauth2/v2/auth?" +
+          params.toString();
+      }
+
+      // ------------------------------------------------------
+      // INSTAGRAM / FACEBOOK
+      // ------------------------------------------------------
+      //
+      // We create the OAuth state here, but we do NOT pretend
+      // that OAuth alone proves a user followed our account.
+      //
+      // The exact Meta product/scopes depend on the Meta app
+      // configuration and approved capabilities.
+      // ------------------------------------------------------
+
+      if (
+        platform === "instagram" ||
+        platform === "facebook"
+      ) {
+        const clientId =
+          process.env.META_CLIENT_ID;
+
+        const redirectUri =
+          process.env.META_REDIRECT_URI;
+
+        if (
+          !clientId ||
+          !redirectUri
+        ) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Meta OAuth is not configured.",
+          );
+        }
+
+        const params =
+          new URLSearchParams({
+            client_id: clientId,
+            redirect_uri: redirectUri,
+            response_type: "code",
+            state,
+          });
+
+        authorizationUrl =
+          "https://www.facebook.com/v24.0/dialog/oauth?" +
+          params.toString();
+      }
+
+      // ------------------------------------------------------
+      // TELEGRAM
+      // ------------------------------------------------------
+      //
+      // Telegram does not use the same OAuth flow.
+      // It will be verified through the Bot API.
+      // ------------------------------------------------------
+
+      if (platform === "telegram") {
+        await stateRef.set(
+          {
+            type: "TELEGRAM",
+          },
+          {
+            merge: true,
+          },
+        );
+
+        return {
+          status: "TELEGRAM_REQUIRES_BOT_VERIFICATION",
+          state,
+        };
+      }
+
+      return {
+        status: "SUCCESS",
+        platform,
+        taskId,
+        state,
+        authorizationUrl,
+      };
+    });
+
+// ============================================================
+// 10. OAUTH CALLBACK
+// ============================================================
+//
+// This endpoint receives authorization codes.
+//
+// NEVER expose client secrets here.
+// ============================================================
+
+export const socialOAuthCallback =
+  functions.https.onRequest(
+    async (req, res) => {
+      try {
+        if (req.method !== "GET") {
+          res
+            .status(405)
+            .send("Method Not Allowed");
+          return;
+        }
+
+        const code =
+          typeof req.query.code === "string"
+            ? req.query.code
+            : null;
+
+        const state =
+          typeof req.query.state === "string"
+            ? req.query.state
+            : null;
+
+        const error =
+          typeof req.query.error === "string"
+            ? req.query.error
+            : null;
+
+        if (error) {
+          res
+            .status(400)
+            .send(
+              "OAuth authorization was denied.",
+            );
+          return;
+        }
+
+        if (!code || !state) {
+          res
+            .status(400)
+            .send(
+              "Missing OAuth code or state.",
+            );
+          return;
+        }
+
+        const stateRef =
+          db.collection("oauthStates").doc(state);
+
+        const stateDoc =
+          await stateRef.get();
+
+        if (!stateDoc.exists) {
+          res
+            .status(400)
+            .send("Invalid OAuth state.");
+          return;
+        }
+
+        const oauthState =
+          stateDoc.data() as OAuthStateData;
+
+        if (
+          oauthState.expiresAt.toMillis() <
+          Date.now()
+        ) {
+          await stateRef.delete();
+
+          res
+            .status(400)
+            .send("OAuth state expired.");
           return;
         }
 
         const {
-          transactionId,
-          userId,
-          rewardAmount,
-          adUnit,
-          customData,
-        } = verification;
+          uid,
+          platform,
+          taskId,
+        } = oauthState;
 
-        /*
-         * custom_data should contain:
-         * {
-         *   uid: "...",
-         *   nonce: "..."
-         * }
-         *
-         * It was created by our server before the ad
-         * was shown.
-         */
-        let custom: {
-          uid?: string;
-          nonce?: string;
-        };
+        // State is one-time use.
+        await stateRef.delete();
 
-        try {
-          custom =
-            JSON.parse(
-              decodeURIComponent(
-                customData,
-              ),
+        // ====================================================
+        // X
+        // ====================================================
+
+        if (platform === "x") {
+          const clientId =
+            process.env.X_CLIENT_ID;
+
+          const clientSecret =
+            process.env.X_CLIENT_SECRET;
+
+          const redirectUri =
+            process.env.X_REDIRECT_URI;
+
+          if (
+            !clientId ||
+            !clientSecret ||
+            !redirectUri
+          ) {
+            throw new Error(
+              "X OAuth configuration missing.",
             );
-        } catch {
-          res.status(400).send(
-            "Invalid custom data",
-          );
-          return;
-        }
+          }
 
-        if (
-          custom.uid !== userId ||
-          !isValidString(custom.nonce)
-        ) {
-          res.status(400).send(
-            "Invalid reward identity",
-          );
-          return;
-        }
+          const basicAuth =
+            Buffer.from(
+              `${clientId}:${clientSecret}`,
+            ).toString("base64");
 
-        const uid =
-          custom.uid;
-
-        const userRef =
-          db.collection("users").doc(uid);
-
-        const adSessionRef =
-          userRef
-            .collection("adSessions")
-            .doc(custom.nonce);
-
-        const globalEventRef =
-          db.collection("adRewardEvents")
-            .doc(transactionId);
-
-        await db.runTransaction(
-          async (transaction) => {
-            /*
-             * Idempotency:
-             * If AdMob retries the same transaction,
-             * DO NOT reward again.
-             */
-            const existingEvent =
-              await transaction.get(
-                globalEventRef,
-              );
-
-            if (existingEvent.exists) {
-              return;
-            }
-
-            const sessionDoc =
-              await transaction.get(
-                adSessionRef,
-              );
-
-            if (!sessionDoc.exists) {
-              throw new Error(
-                "Unknown ad session.",
-              );
-            }
-
-            const session =
-              sessionDoc.data();
-
-            if (
-              !session ||
-              session.status !==
-                "PENDING"
-            ) {
-              throw new Error(
-                "Ad session already used.",
-              );
-            }
-
-            const userDoc =
-              await transaction.get(
-                userRef,
-              );
-
-            if (!userDoc.exists) {
-              throw new Error(
-                "User does not exist.",
-              );
-            }
-
-            /*
-             * Daily limit is checked server-side.
-             */
-            const today =
-              dayKey();
-
-            const dailyRef =
-              userRef
-                .collection("adSessions")
-                .doc(`daily_${today}`);
-
-            const dailyDoc =
-              await transaction.get(
-                dailyRef,
-              );
-
-            const currentCount =
-              Number(
-                dailyDoc.data()?.count || 0,
-              );
-
-            if (
-              currentCount >=
-              MAX_ADS_PER_DAY
-            ) {
-              throw new Error(
-                "Daily ad limit reached.",
-              );
-            }
-
-            /*
-             * Validate the ad unit against your
-             * server configuration.
-             *
-             * Recommended:
-             * store the real AdMob ad unit in:
-             *
-             * /config/rewards
-             *
-             * field:
-             * rewardedAdUnitId
-             */
-            const configRef =
-              db
-                .collection("config")
-                .doc("rewards");
-
-            const configDoc =
-              await transaction.get(
-                configRef,
-              );
-
-            const config =
-              configDoc.data();
-
-            const expectedAdUnit =
-              config?.rewardedAdUnitId;
-
-            const expectedAmount =
-              Number(
-                config?.adRewardAmount,
-              );
-
-            if (
-              !expectedAdUnit ||
-              !Number.isFinite(
-                expectedAmount,
-              )
-            ) {
-              throw new Error(
-                "Reward configuration is missing.",
-              );
-            }
-
-            if (
-              adUnit !==
-              expectedAdUnit
-            ) {
-              throw new Error(
-                "Unexpected AdMob ad unit.",
-              );
-            }
-
-            if (
-              rewardAmount !==
-              expectedAmount
-            ) {
-              throw new Error(
-                "Unexpected AdMob reward amount.",
-              );
-            }
-
-            const transactionRef =
-              userRef
-                .collection("transactions")
-                .doc();
-
-            /*
-             * ATOMIC:
-             * 1. increment balance
-             * 2. create transaction
-             * 3. consume ad session
-             * 4. update daily count
-             * 5. create global idempotency record
-             */
-
-            transaction.update(
-              userRef,
+          const tokenResponse =
+            await fetch(
+              "https://api.x.com/2/oauth2/token",
               {
-                fanBalance:
-                  admin.firestore.FieldValue
-                    .increment(
-                      rewardAmount,
-                    ),
-
-                totalAdRewards:
-                  admin.firestore.FieldValue
-                    .increment(
-                      rewardAmount,
-                    ),
-
-                updatedAt:
-                  admin.firestore.FieldValue
-                    .serverTimestamp(),
+                method: "POST",
+                headers: {
+                  "Content-Type":
+                    "application/x-www-form-urlencoded",
+                  Authorization:
+                    `Basic ${basicAuth}`,
+                },
+                body:
+                  new URLSearchParams({
+                    code,
+                    grant_type:
+                      "authorization_code",
+                    redirect_uri:
+                      redirectUri,
+                    code_verifier:
+                      state,
+                  }),
               },
             );
 
-            transaction.set(
-              transactionRef,
+          if (!tokenResponse.ok) {
+            throw new Error(
+              "X token exchange failed.",
+            );
+          }
+
+          const token =
+            await tokenResponse.json() as {
+              access_token?: string;
+              refresh_token?: string;
+            };
+
+          if (!token.access_token) {
+            throw new Error(
+              "X access token missing.",
+            );
+          }
+
+          const userResponse =
+            await fetch(
+              "https://api.x.com/2/users/me",
               {
-                type: "AD_REWARD",
-                amount: rewardAmount,
-                currency: "FAN",
-
-                adMobTransactionId:
-                  transactionId,
-
-                adUnit,
-
-                status: "SUCCESS",
-
-                createdAt:
-                  admin.firestore.FieldValue
-                    .serverTimestamp(),
+                headers: {
+                  Authorization:
+                    `Bearer ${token.access_token}`,
+                },
               },
             );
 
-            transaction.update(
-              adSessionRef,
-              {
-                status: "CLAIMED",
-
-                claimedAt:
-                  admin.firestore.FieldValue
-                    .serverTimestamp(),
-
-                adMobTransactionId:
-                  transactionId,
-              },
+          if (!userResponse.ok) {
+            throw new Error(
+              "X user verification failed.",
             );
+          }
 
-            transaction.set(
-              dailyRef,
+          const xUser =
+            await userResponse.json() as {
+              data?: {
+                id?: string;
+                username?: string;
+              };
+            };
+
+          const xUserId =
+            xUser.data?.id;
+
+          if (!xUserId) {
+            throw new Error(
+              "X user ID missing.",
+            );
+          }
+
+          /*
+           * Save only what is needed.
+           *
+           * DO NOT save the access token in a
+           * client-readable Firestore document.
+           */
+          await db
+            .collection("users")
+            .doc(uid)
+            .collection("socialAccounts")
+            .doc("x")
+            .set(
               {
-                count:
-                  currentCount + 1,
-
+                platform: "x",
+                platformUserId: xUserId,
+                username:
+                  xUser.data?.username ||
+                  null,
+                connected: true,
                 updatedAt:
                   admin.firestore.FieldValue
                     .serverTimestamp(),
@@ -1013,71 +587,458 @@ export const admobRewardSsv =
               },
             );
 
-            transaction.set(
-              globalEventRef,
+          /*
+           * Token storage belongs in a protected
+           * server-side secret/token store.
+           *
+           * This function intentionally does not
+           * write the access token to normal user data.
+           */
+
+          await createSocialVerification(
+            uid,
+            taskId,
+            "x",
+            xUserId,
+          );
+        }
+
+        // ====================================================
+        // TIKTOK
+        // ====================================================
+
+        if (platform === "tiktok") {
+          const clientKey =
+            process.env.TIKTOK_CLIENT_KEY;
+
+          const clientSecret =
+            process.env.TIKTOK_CLIENT_SECRET;
+
+          const redirectUri =
+            process.env.TIKTOK_REDIRECT_URI;
+
+          if (
+            !clientKey ||
+            !clientSecret ||
+            !redirectUri
+          ) {
+            throw new Error(
+              "TikTok OAuth configuration missing.",
+            );
+          }
+
+          const tokenResponse =
+            await fetch(
+              "https://open.tiktokapis.com/v2/oauth/token/",
               {
-                uid,
+                method: "POST",
+                headers: {
+                  "Content-Type":
+                    "application/x-www-form-urlencoded",
+                },
+                body:
+                  new URLSearchParams({
+                    client_key:
+                      clientKey,
+                    client_secret:
+                      clientSecret,
+                    code,
+                    grant_type:
+                      "authorization_code",
+                    redirect_uri:
+                      redirectUri,
+                  }),
+              },
+            );
 
-                transactionId,
+          if (!tokenResponse.ok) {
+            throw new Error(
+              "TikTok token exchange failed.",
+            );
+          }
 
-                rewardAmount,
+          const token =
+            await tokenResponse.json() as {
+              access_token?: string;
+              open_id?: string;
+              refresh_token?: string;
+            };
 
-                adUnit,
+          if (
+            !token.access_token ||
+            !token.open_id
+          ) {
+            throw new Error(
+              "TikTok authorization failed.",
+            );
+          }
 
-                createdAt:
+          const profileResponse =
+            await fetch(
+              "https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name,avatar_url",
+              {
+                headers: {
+                  Authorization:
+                    `Bearer ${token.access_token}`,
+                },
+              },
+            );
+
+          if (!profileResponse.ok) {
+            throw new Error(
+              "TikTok profile verification failed.",
+            );
+          }
+
+          await db
+            .collection("users")
+            .doc(uid)
+            .collection("socialAccounts")
+            .doc("tiktok")
+            .set(
+              {
+                platform: "tiktok",
+                platformUserId:
+                  token.open_id,
+                connected: true,
+                updatedAt:
                   admin.firestore.FieldValue
                     .serverTimestamp(),
               },
+              {
+                merge: true,
+              },
             );
-          },
-        );
 
-        /*
-         * Google expects HTTP 200.
-         */
-        res.status(200).send("OK");
+          /*
+           * IMPORTANT:
+           *
+           * Login success alone does NOT prove that
+           * the user followed our TikTok account.
+           *
+           * Therefore we do NOT grant the social
+           * follow reward here.
+           */
+        }
+
+        // ====================================================
+        // YOUTUBE
+        // ====================================================
+
+        if (platform === "youtube") {
+          const clientId =
+            process.env.GOOGLE_CLIENT_ID;
+
+          const clientSecret =
+            process.env.GOOGLE_CLIENT_SECRET;
+
+          const redirectUri =
+            process.env.GOOGLE_REDIRECT_URI;
+
+          if (
+            !clientId ||
+            !clientSecret ||
+            !redirectUri
+          ) {
+            throw new Error(
+              "Google OAuth configuration missing.",
+            );
+          }
+
+          const tokenResponse =
+            await fetch(
+              "https://oauth2.googleapis.com/token",
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type":
+                    "application/x-www-form-urlencoded",
+                },
+                body:
+                  new URLSearchParams({
+                    code,
+                    client_id:
+                      clientId,
+                    client_secret:
+                      clientSecret,
+                    redirect_uri:
+                      redirectUri,
+                    grant_type:
+                      "authorization_code",
+                  }),
+              },
+            );
+
+          if (!tokenResponse.ok) {
+            throw new Error(
+              "Google token exchange failed.",
+            );
+          }
+
+          const token =
+            await tokenResponse.json() as {
+              access_token?: string;
+              refresh_token?: string;
+            };
+
+          if (!token.access_token) {
+            throw new Error(
+              "YouTube access token missing.",
+            );
+          }
+
+          /*
+           * Read authenticated user's subscriptions.
+           *
+           * The target channel ID must come from:
+           *
+           * /config/socialTasks
+           */
+
+          const configDoc =
+            await db
+              .collection("config")
+              .doc("socialTasks")
+              .get();
+
+          const youtubeConfig =
+            configDoc.data()?.youtube;
+
+          const targetChannelId =
+            youtubeConfig?.targetChannelId;
+
+          if (!targetChannelId) {
+            throw new Error(
+              "YouTube target channel is not configured.",
+            );
+          }
+
+          const subscriptionsUrl =
+            new URL(
+              "https://www.googleapis.com/youtube/v3/subscriptions",
+            );
+
+          subscriptionsUrl.searchParams.set(
+            "part",
+            "snippet",
+          );
+
+          subscriptionsUrl.searchParams.set(
+            "mine",
+            "true",
+          );
+
+          subscriptionsUrl.searchParams.set(
+            "maxResults",
+            "50",
+          );
+
+          const subscriptionResponse =
+            await fetch(
+              subscriptionsUrl.toString(),
+              {
+                headers: {
+                  Authorization:
+                    `Bearer ${token.access_token}`,
+                },
+              },
+            );
+
+          if (!subscriptionResponse.ok) {
+            throw new Error(
+              "YouTube subscription verification failed.",
+            );
+          }
+
+          const subscriptions =
+            await subscriptionResponse.json() as {
+              items?: Array<{
+                snippet?: {
+                  resourceId?: {
+                    channelId?: string;
+                  };
+                };
+              }>;
+            };
+
+          const subscribed =
+            (subscriptions.items || [])
+              .some(
+                (item) =>
+                  item.snippet
+                    ?.resourceId
+                    ?.channelId ===
+                  targetChannelId,
+              );
+
+          if (!subscribed) {
+            throw new Error(
+              "YouTube subscription not verified.",
+            );
+          }
+
+          await createSocialVerification(
+            uid,
+            taskId,
+            "youtube",
+            targetChannelId,
+          );
+        }
+
+        // ====================================================
+        // META
+        // ====================================================
+        //
+        // OAuth connection is recorded, but we do not claim
+        // that OAuth itself proves the user followed a Page
+        // or Instagram account.
+        // ====================================================
+
+        if (
+          platform === "instagram" ||
+          platform === "facebook"
+        ) {
+          /*
+           * The exact Meta API product and permissions must
+           * match the capabilities approved for your Meta app.
+           *
+           * Do NOT automatically create VERIFIED here.
+           */
+          await db
+            .collection("users")
+            .doc(uid)
+            .collection("socialAccounts")
+            .doc(platform)
+            .set(
+              {
+                platform,
+                connected: true,
+                oauthReceivedAt:
+                  admin.firestore.FieldValue
+                    .serverTimestamp(),
+              },
+              {
+                merge: true,
+              },
+            );
+        }
+
+        res
+          .status(200)
+          .send(
+            "Social account authorization completed. Return to the app.",
+          );
       } catch (error) {
         console.error(
-          "AdMob SSV error:",
+          "Social OAuth callback error:",
           error,
         );
 
-        /*
-         * Do NOT grant a reward when verification fails.
-         */
-        res.status(400).send("Rejected");
+        res
+          .status(400)
+          .send(
+            "Social authorization failed.",
+          );
       }
     },
   );
 
 // ============================================================
-// 6. CLAIM VERIFIED SOCIAL/TASK REWARD
+// 11. CREATE VERIFIED SOCIAL RECORD
 // ============================================================
 //
-// IMPORTANT:
-//
-// This function does NOT trust:
-//   data.completed = true
-//
-// It requires a verification document created by a
-// trusted backend integration.
-//
-// Example:
-//
-// /users/{uid}/taskVerifications/{taskId}
-//
-// {
-//   status: "VERIFIED",
-//   rewardAmount: 50,
-//   expiresAt: ...,
-//   verificationId: "..."
-// }
-//
-// The Flutter client must NOT be allowed to create
-// or modify these documents.
+// ONLY trusted backend code calls this.
+// Flutter cannot call this directly.
 // ============================================================
 
-export const claimVerifiedTaskReward =
+async function createSocialVerification(
+  uid: string,
+  taskId: string,
+  platform: SocialPlatform,
+  evidenceId: string,
+): Promise<void> {
+  const userRef =
+    db.collection("users").doc(uid);
+
+  const verificationRef =
+    userRef
+      .collection("taskVerifications")
+      .doc(taskId);
+
+  const configDoc =
+    await db
+      .collection("config")
+      .doc("socialTasks")
+      .get();
+
+  const taskConfig =
+    configDoc
+      .data()
+      ?.[platform];
+
+  const rewardAmount =
+    Number(
+      taskConfig?.reward || 0,
+    );
+
+  if (
+    !Number.isFinite(
+      rewardAmount,
+    ) ||
+    rewardAmount <= 0
+  ) {
+    throw new Error(
+      "Invalid social reward configuration.",
+    );
+  }
+
+  const verificationId =
+    crypto.randomUUID();
+
+  await verificationRef.set(
+    {
+      type: "SOCIAL",
+
+      status: "VERIFIED",
+
+      taskId,
+
+      platform,
+
+      evidenceId,
+
+      rewardAmount,
+
+      verificationId,
+
+      verifiedAt:
+        admin.firestore.FieldValue
+          .serverTimestamp(),
+
+      expiresAt:
+        admin.firestore.Timestamp.fromMillis(
+          Date.now() +
+            10 * 60 * 1000,
+        ),
+    },
+  );
+}
+
+// ============================================================
+// 12. TELEGRAM VERIFICATION
+// ============================================================
+//
+// Telegram verification uses the Telegram Bot API.
+// The bot must be an administrator in the target channel/group
+// when the API requires administrator-level access.
+//
+// Client supplies a Telegram username/user ID.
+// Backend asks Telegram for the member status.
+//
+// NEVER trust the client saying "I joined".
+// ============================================================
+
+export const verifyTelegramMembership =
   functions
     .runWith({
       enforceAppCheck: true,
@@ -1086,401 +1047,120 @@ export const claimVerifiedTaskReward =
       const uid = requireAuth(context);
 
       if (
-        !data ||
-        !isValidString(data.taskId)
+        !isValidString(data?.taskId)
       ) {
         throwInvalid(
-          "A valid taskId is required.",
+          "taskId is required.",
         );
       }
 
       const taskId =
         data.taskId.trim();
 
-      const userRef =
-        db.collection("users").doc(uid);
+      const telegramUserId =
+        String(
+          data?.telegramUserId || "",
+        ).trim();
 
-      const verificationRef =
-        userRef
-          .collection("taskVerifications")
-          .doc(taskId);
-
-      const claimRef =
-        userRef
-          .collection("taskClaims")
-          .doc(taskId);
-
-      return db.runTransaction(
-        async (transaction) => {
-          const verificationDoc =
-            await transaction.get(
-              verificationRef,
-            );
-
-          if (!verificationDoc.exists) {
-            throw new functions.https.HttpsError(
-              "failed-precondition",
-              "Task has not been verified.",
-            );
-          }
-
-          const verification =
-            verificationDoc.data();
-
-          if (
-            !verification ||
-            verification.status !==
-              "VERIFIED"
-          ) {
-            throw new functions.https.HttpsError(
-              "failed-precondition",
-              "Task verification is not valid.",
-            );
-          }
-
-          const expiresAt =
-            verification.expiresAt;
-
-          if (
-            expiresAt &&
-            expiresAt.toMillis() <
-              Date.now()
-          ) {
-            throw new functions.https.HttpsError(
-              "deadline-exceeded",
-              "Task verification has expired.",
-            );
-          }
-
-          const claimDoc =
-            await transaction.get(
-              claimRef,
-            );
-
-          if (claimDoc.exists) {
-            throw new functions.https.HttpsError(
-              "already-exists",
-              "This task reward has already been claimed.",
-            );
-          }
-
-          const rewardAmount =
-            Number(
-              verification.rewardAmount,
-            );
-
-          if (
-            !Number.isFinite(
-              rewardAmount,
-            ) ||
-            rewardAmount <= 0
-          ) {
-            throw new functions.https.HttpsError(
-              "internal",
-              "Invalid server reward configuration.",
-            );
-          }
-
-          const userDoc =
-            await transaction.get(
-              userRef,
-            );
-
-          if (!userDoc.exists) {
-            throw new functions.https.HttpsError(
-              "not-found",
-              "User account does not exist.",
-            );
-          }
-
-          const txRef =
-            userRef
-              .collection("transactions")
-              .doc();
-
-          transaction.update(
-            userRef,
-            {
-              fanBalance:
-                admin.firestore.FieldValue
-                  .increment(
-                    rewardAmount,
-                  ),
-
-              totalTaskRewards:
-                admin.firestore.FieldValue
-                  .increment(
-                    rewardAmount,
-                  ),
-
-              totalRewards:
-                admin.firestore.FieldValue
-                  .increment(
-                    rewardAmount,
-                  ),
-
-              updatedAt:
-                admin.firestore.FieldValue
-                  .serverTimestamp(),
-            },
-          );
-
-          transaction.set(
-            txRef,
-            {
-              type: "TASK_REWARD",
-              taskId,
-              amount: rewardAmount,
-              currency: "FAN",
-
-              verificationId:
-                verification.verificationId ||
-                null,
-
-              status: "SUCCESS",
-
-              createdAt:
-                admin.firestore.FieldValue
-                  .serverTimestamp(),
-            },
-          );
-
-          transaction.set(
-            claimRef,
-            {
-              status: "CLAIMED",
-
-              rewardAmount,
-
-              verificationId:
-                verification.verificationId ||
-                null,
-
-              claimedAt:
-                admin.firestore.FieldValue
-                  .serverTimestamp(),
-            },
-          );
-
-          /*
-           * Consume verification so the same proof
-           * cannot be reused.
-           */
-          transaction.update(
-            verificationRef,
-            {
-              status: "CONSUMED",
-
-              consumedAt:
-                admin.firestore.FieldValue
-                  .serverTimestamp(),
-            },
-          );
-
-          return {
-            status: "SUCCESS",
-            rewardGranted: rewardAmount,
-          };
-        },
-      );
-    });
-
-// ============================================================
-// 7. SOCIAL REWARD
-// ============================================================
-//
-// This is intentionally NOT a fake "user clicked follow"
-// verification.
-//
-// The actual social platform integration must create the
-// VERIFIED document first.
-//
-// Once verified, this function safely pays it.
-// ============================================================
-
-export const claimSocialReward =
-  functions
-    .runWith({
-      enforceAppCheck: true,
-    })
-    .https.onCall(async (data, context) => {
-      if (
-        !data ||
-        !isValidString(data.taskId)
-      ) {
+      if (!telegramUserId) {
         throwInvalid(
-          "A valid social taskId is required.",
+          "telegramUserId is required.",
         );
       }
 
-      /*
-       * Reuse the same secure reward engine.
-       */
-      const uid =
-        requireAuth(context);
+      const botToken =
+        process.env.TELEGRAM_BOT_TOKEN;
 
-      const taskId =
-        data.taskId.trim();
+      if (!botToken) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Telegram bot is not configured.",
+        );
+      }
 
-      const userRef =
-        db.collection("users").doc(uid);
+      const configDoc =
+        await db
+          .collection("config")
+          .doc("socialTasks")
+          .get();
 
-      const verificationRef =
-        userRef
-          .collection("taskVerifications")
-          .doc(taskId);
+      const telegramConfig =
+        configDoc.data()?.telegram;
 
-      const claimRef =
-        userRef
-          .collection("taskClaims")
-          .doc(taskId);
+      const chatId =
+        telegramConfig?.chatId;
 
-      return db.runTransaction(
-        async (transaction) => {
-          const verificationDoc =
-            await transaction.get(
-              verificationRef,
-            );
+      if (!chatId) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Telegram chat ID is not configured.",
+        );
+      }
 
-          if (!verificationDoc.exists) {
-            throw new functions.https.HttpsError(
-              "failed-precondition",
-              "Social task has not been verified.",
-            );
-          }
+      const url =
+        `https://api.telegram.org/bot${botToken}/getChatMember`;
 
-          const verification =
-            verificationDoc.data();
+      const response =
+        await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type":
+              "application/json",
+          },
+          body: JSON.stringify({
+            chat_id: chatId,
+            user_id:
+              telegramUserId,
+          }),
+        });
 
-          if (
-            !verification ||
-            verification.status !==
-              "VERIFIED" ||
-            verification.type !==
-              "SOCIAL"
-          ) {
-            throw new functions.https.HttpsError(
-              "failed-precondition",
-              "Invalid social verification.",
-            );
-          }
+      if (!response.ok) {
+        throw new functions.https.HttpsError(
+          "unavailable",
+          "Telegram verification request failed.",
+        );
+      }
 
-          const claimDoc =
-            await transaction.get(
-              claimRef,
-            );
-
-          if (claimDoc.exists) {
-            throw new functions.https.HttpsError(
-              "already-exists",
-              "Social reward already claimed.",
-            );
-          }
-
-          const rewardAmount =
-            Number(
-              verification.rewardAmount,
-            );
-
-          if (
-            !Number.isFinite(
-              rewardAmount,
-            ) ||
-            rewardAmount <= 0
-          ) {
-            throw new functions.https.HttpsError(
-              "internal",
-              "Invalid social reward.",
-            );
-          }
-
-          const txRef =
-            userRef
-              .collection("transactions")
-              .doc();
-
-          transaction.update(
-            userRef,
-            {
-              fanBalance:
-                admin.firestore.FieldValue
-                  .increment(
-                    rewardAmount,
-                  ),
-
-              totalSocialRewards:
-                admin.firestore.FieldValue
-                  .increment(
-                    rewardAmount,
-                  ),
-
-              totalRewards:
-                admin.firestore.FieldValue
-                  .increment(
-                    rewardAmount,
-                  ),
-
-              updatedAt:
-                admin.firestore.FieldValue
-                  .serverTimestamp(),
-            },
-          );
-
-          transaction.set(
-            txRef,
-            {
-              type: "SOCIAL_REWARD",
-
-              taskId,
-
-              amount: rewardAmount,
-
-              currency: "FAN",
-
-              verificationId:
-                verification.verificationId ||
-                null,
-
-              status: "SUCCESS",
-
-              createdAt:
-                admin.firestore.FieldValue
-                  .serverTimestamp(),
-            },
-          );
-
-          transaction.set(
-            claimRef,
-            {
-              status: "CLAIMED",
-
-              rewardAmount,
-
-              verificationId:
-                verification.verificationId ||
-                null,
-
-              claimedAt:
-                admin.firestore.FieldValue
-                  .serverTimestamp(),
-            },
-          );
-
-          transaction.update(
-            verificationRef,
-            {
-              status: "CONSUMED",
-
-              consumedAt:
-                admin.firestore.FieldValue
-                  .serverTimestamp(),
-            },
-          );
-
-          return {
-            status: "SUCCESS",
-            rewardGranted: rewardAmount,
+      const result =
+        await response.json() as {
+          ok?: boolean;
+          result?: {
+            status?: string;
           };
-        },
+        };
+
+      if (!result.ok) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Telegram membership could not be verified.",
+        );
+      }
+
+      const memberStatus =
+        result.result?.status;
+
+      const isMember =
+        memberStatus === "member" ||
+        memberStatus === "administrator" ||
+        memberStatus === "creator";
+
+      if (!isMember) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Telegram membership not verified.",
+        );
+      }
+
+      await createSocialVerification(
+        uid,
+        taskId,
+        "telegram",
+        telegramUserId,
       );
+
+      return {
+        status: "VERIFIED",
+        platform: "telegram",
+        taskId,
+      };
     });

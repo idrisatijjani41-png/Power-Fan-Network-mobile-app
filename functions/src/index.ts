@@ -2,25 +2,24 @@
 // 8. SOCIAL MEDIA OAUTH / API VERIFICATION
 // ============================================================
 //
-// IMPORTANT:
-// - OAuth secrets stay on the server.
-// - Flutter never receives client secrets.
-// - OAuth state prevents CSRF.
-// - A social reward is created ONLY after backend verification.
-// - Never trust "I followed" from Flutter.
+// POWER FAN NETWORK
+// SERVER-AUTHORITATIVE SOCIAL REWARD SYSTEM
 //
-// Supported architecture:
+// Supported:
 //   X
-//   Instagram / Meta
-//   Facebook
 //   TikTok
 //   YouTube
 //   Telegram
+//   Facebook / Instagram OAuth connection
 //
 // IMPORTANT:
-// Not every platform exposes an API that allows us to verify
-// every possible social action. We only grant rewards where
-// the official API provides sufficient evidence.
+// - Flutter never receives client secrets.
+// - Flutter never creates VERIFIED records.
+// - Flutter never creates reward transactions.
+// - Flutter never changes FAN balance.
+// - OAuth state is one-time and expires.
+// - X uses OAuth 2.0 PKCE.
+// - Rewards are granted only after server verification.
 // ============================================================
 
 type SocialPlatform =
@@ -36,6 +35,10 @@ type OAuthStateData = {
   platform: SocialPlatform;
   taskId: string;
   state: string;
+
+  // X PKCE
+  codeVerifier?: string;
+
   createdAt: admin.firestore.Timestamp;
   expiresAt: admin.firestore.Timestamp;
 };
@@ -60,26 +63,28 @@ function requirePlatform(
   return value;
 }
 
-// ------------------------------------------------------------
-// SOCIAL CONFIG
-// ------------------------------------------------------------
-//
-// Put public task configuration in:
-//
-// /config/socialTasks
-//
-// Example:
-// {
-//   x: {
-//     enabled: true,
-//     url: "https://x.com/YOUR_ACCOUNT",
-//     reward: 50,
-//     targetUserId: "..."
-//   }
-// }
-//
-// NEVER put client secrets here.
-// ------------------------------------------------------------
+// ============================================================
+// GENERATE PKCE VALUES
+// ============================================================
+
+function generatePkceVerifier(): string {
+  return crypto
+    .randomBytes(48)
+    .toString("base64url");
+}
+
+function generatePkceChallenge(
+  verifier: string,
+): string {
+  return crypto
+    .createHash("sha256")
+    .update(verifier)
+    .digest("base64url");
+}
+
+// ============================================================
+// GET SOCIAL TASK CONFIG
+// ============================================================
 
 export const getSocialTasks =
   functions
@@ -110,7 +115,7 @@ export const getSocialTasks =
     });
 
 // ============================================================
-// 9. CREATE SOCIAL OAUTH SESSION
+// START SOCIAL OAUTH
 // ============================================================
 
 export const startSocialOAuth =
@@ -122,13 +127,9 @@ export const startSocialOAuth =
       const uid = requireAuth(context);
 
       const platform =
-        requirePlatform(
-          data?.platform,
-        );
+        requirePlatform(data?.platform);
 
-      if (
-        !isValidString(data?.taskId)
-      ) {
+      if (!isValidString(data?.taskId)) {
         throwInvalid(
           "taskId is required.",
         );
@@ -137,63 +138,57 @@ export const startSocialOAuth =
       const taskId =
         data.taskId.trim();
 
-      const state =
-        crypto.randomBytes(32).toString("hex");
-
       const now =
         admin.firestore.Timestamp.now();
 
       const expiresAt =
         admin.firestore.Timestamp.fromMillis(
-          Date.now() + 10 * 60 * 1000,
+          Date.now() +
+            10 * 60 * 1000,
         );
 
-      const stateRef =
-        db
-          .collection("oauthStates")
-          .doc(state);
+      const state =
+        crypto
+          .randomBytes(32)
+          .toString("hex");
 
-      const stateData: OAuthStateData = {
-        uid,
-        platform,
-        taskId,
-        state,
-        createdAt: now,
-        expiresAt,
-      };
-
-      await stateRef.set(stateData);
+      let codeVerifier:
+        | string
+        | undefined;
 
       let authorizationUrl = "";
 
-      // ------------------------------------------------------
+      // ======================================================
       // X
-      // ------------------------------------------------------
+      // ======================================================
 
       if (platform === "x") {
         const clientId =
           process.env.X_CLIENT_ID;
 
-        if (!clientId) {
+        const redirectUri =
+          process.env.X_REDIRECT_URI;
+
+        if (
+          !clientId ||
+          !redirectUri
+        ) {
           throw new functions.https.HttpsError(
             "failed-precondition",
             "X OAuth is not configured.",
           );
         }
 
-        const redirectUri =
-          process.env.X_REDIRECT_URI;
+        codeVerifier =
+          generatePkceVerifier();
 
-        if (!redirectUri) {
-          throw new functions.https.HttpsError(
-            "failed-precondition",
-            "X redirect URI is not configured.",
+        const codeChallenge =
+          generatePkceChallenge(
+            codeVerifier,
           );
-        }
 
         const scopes = [
           "users.read",
-          "tweet.read",
           "follows.read",
           "offline.access",
         ].join(" ");
@@ -205,16 +200,20 @@ export const startSocialOAuth =
             redirect_uri: redirectUri,
             scope: scopes,
             state,
+            code_challenge:
+              codeChallenge,
+            code_challenge_method:
+              "S256",
           });
 
         authorizationUrl =
-          "https://twitter.com/i/oauth2/authorize?" +
+          "https://x.com/i/oauth2/authorize?" +
           params.toString();
       }
 
-      // ------------------------------------------------------
+      // ======================================================
       // TIKTOK
-      // ------------------------------------------------------
+      // ======================================================
 
       if (platform === "tiktok") {
         const clientKey =
@@ -233,12 +232,23 @@ export const startSocialOAuth =
           );
         }
 
+        const scopes =
+          "user.info.basic";
+
         const params =
           new URLSearchParams({
-            client_key: clientKey,
-            response_type: "code",
-            scope: "user.info.basic",
-            redirect_uri: redirectUri,
+            client_key:
+              clientKey,
+
+            response_type:
+              "code",
+
+            scope:
+              scopes,
+
+            redirect_uri:
+              redirectUri,
+
             state,
           });
 
@@ -247,9 +257,9 @@ export const startSocialOAuth =
           params.toString();
       }
 
-      // ------------------------------------------------------
+      // ======================================================
       // YOUTUBE / GOOGLE
-      // ------------------------------------------------------
+      // ======================================================
 
       if (platform === "youtube") {
         const clientId =
@@ -268,17 +278,29 @@ export const startSocialOAuth =
           );
         }
 
-        const scope =
+        const scopes =
           "https://www.googleapis.com/auth/youtube.readonly";
 
         const params =
           new URLSearchParams({
-            client_id: clientId,
-            redirect_uri: redirectUri,
-            response_type: "code",
-            access_type: "offline",
-            prompt: "consent",
-            scope,
+            client_id:
+              clientId,
+
+            redirect_uri:
+              redirectUri,
+
+            response_type:
+              "code",
+
+            access_type:
+              "offline",
+
+            prompt:
+              "consent",
+
+            scope:
+              scopes,
+
             state,
           });
 
@@ -287,20 +309,13 @@ export const startSocialOAuth =
           params.toString();
       }
 
-      // ------------------------------------------------------
-      // INSTAGRAM / FACEBOOK
-      // ------------------------------------------------------
-      //
-      // We create the OAuth state here, but we do NOT pretend
-      // that OAuth alone proves a user followed our account.
-      //
-      // The exact Meta product/scopes depend on the Meta app
-      // configuration and approved capabilities.
-      // ------------------------------------------------------
+      // ======================================================
+      // FACEBOOK / INSTAGRAM
+      // ======================================================
 
       if (
-        platform === "instagram" ||
-        platform === "facebook"
+        platform === "facebook" ||
+        platform === "instagram"
       ) {
         const clientId =
           process.env.META_CLIENT_ID;
@@ -320,9 +335,15 @@ export const startSocialOAuth =
 
         const params =
           new URLSearchParams({
-            client_id: clientId,
-            redirect_uri: redirectUri,
-            response_type: "code",
+            client_id:
+              clientId,
+
+            redirect_uri:
+              redirectUri,
+
+            response_type:
+              "code",
+
             state,
           });
 
@@ -331,46 +352,73 @@ export const startSocialOAuth =
           params.toString();
       }
 
-      // ------------------------------------------------------
+      // ======================================================
       // TELEGRAM
-      // ------------------------------------------------------
-      //
-      // Telegram does not use the same OAuth flow.
-      // It will be verified through the Bot API.
-      // ------------------------------------------------------
+      // ======================================================
 
       if (platform === "telegram") {
-        await stateRef.set(
-          {
-            type: "TELEGRAM",
-          },
-          {
-            merge: true,
-          },
-        );
+        const stateRef =
+          db
+            .collection("oauthStates")
+            .doc(state);
+
+        await stateRef.set({
+          uid,
+          platform,
+          taskId,
+          state,
+          createdAt: now,
+          expiresAt,
+        });
 
         return {
-          status: "TELEGRAM_REQUIRES_BOT_VERIFICATION",
+          status:
+            "TELEGRAM_REQUIRES_BOT_VERIFICATION",
+
+          platform,
+          taskId,
           state,
         };
       }
+
+      // ======================================================
+      // SAVE OAUTH STATE
+      // ======================================================
+
+      const stateRef =
+        db
+          .collection("oauthStates")
+          .doc(state);
+
+      const stateData:
+        OAuthStateData = {
+        uid,
+        platform,
+        taskId,
+        state,
+        createdAt: now,
+        expiresAt,
+      };
+
+      if (codeVerifier) {
+        stateData.codeVerifier =
+          codeVerifier;
+      }
+
+      await stateRef.set(
+        stateData,
+      );
 
       return {
         status: "SUCCESS",
         platform,
         taskId,
-        state,
         authorizationUrl,
       };
     });
 
 // ============================================================
-// 10. OAUTH CALLBACK
-// ============================================================
-//
-// This endpoint receives authorization codes.
-//
-// NEVER expose client secrets here.
+// 9. SOCIAL OAUTH CALLBACK
 // ============================================================
 
 export const socialOAuthCallback =
@@ -381,6 +429,7 @@ export const socialOAuthCallback =
           res
             .status(405)
             .send("Method Not Allowed");
+
           return;
         }
 
@@ -394,17 +443,18 @@ export const socialOAuthCallback =
             ? req.query.state
             : null;
 
-        const error =
+        const oauthError =
           typeof req.query.error === "string"
             ? req.query.error
             : null;
 
-        if (error) {
+        if (oauthError) {
           res
             .status(400)
             .send(
               "OAuth authorization was denied.",
             );
+
           return;
         }
 
@@ -414,11 +464,14 @@ export const socialOAuthCallback =
             .send(
               "Missing OAuth code or state.",
             );
+
           return;
         }
 
         const stateRef =
-          db.collection("oauthStates").doc(state);
+          db
+            .collection("oauthStates")
+            .doc(state);
 
         const stateDoc =
           await stateRef.get();
@@ -426,22 +479,33 @@ export const socialOAuthCallback =
         if (!stateDoc.exists) {
           res
             .status(400)
-            .send("Invalid OAuth state.");
+            .send(
+              "Invalid or already-used OAuth state.",
+            );
+
           return;
         }
 
         const oauthState =
           stateDoc.data() as OAuthStateData;
 
+        // ====================================================
+        // EXPIRATION CHECK
+        // ====================================================
+
         if (
+          !oauthState.expiresAt ||
           oauthState.expiresAt.toMillis() <
-          Date.now()
+            Date.now()
         ) {
           await stateRef.delete();
 
           res
             .status(400)
-            .send("OAuth state expired.");
+            .send(
+              "OAuth session expired.",
+            );
+
           return;
         }
 
@@ -449,13 +513,17 @@ export const socialOAuthCallback =
           uid,
           platform,
           taskId,
+          codeVerifier,
         } = oauthState;
 
-        // State is one-time use.
+        // ====================================================
+        // ONE-TIME STATE
+        // ====================================================
+
         await stateRef.delete();
 
         // ====================================================
-        // X
+        // X OAUTH 2.0 PKCE
         // ====================================================
 
         if (platform === "x") {
@@ -471,43 +539,60 @@ export const socialOAuthCallback =
           if (
             !clientId ||
             !clientSecret ||
-            !redirectUri
+            !redirectUri ||
+            !codeVerifier
           ) {
             throw new Error(
-              "X OAuth configuration missing.",
+              "X OAuth configuration is incomplete.",
             );
           }
 
           const basicAuth =
-            Buffer.from(
-              `${clientId}:${clientSecret}`,
-            ).toString("base64");
+            Buffer
+              .from(
+                `${clientId}:${clientSecret}`,
+              )
+              .toString("base64");
 
           const tokenResponse =
             await fetch(
               "https://api.x.com/2/oauth2/token",
               {
                 method: "POST",
+
                 headers: {
                   "Content-Type":
                     "application/x-www-form-urlencoded",
+
                   Authorization:
                     `Basic ${basicAuth}`,
                 },
+
                 body:
                   new URLSearchParams({
                     code,
+
                     grant_type:
                       "authorization_code",
+
                     redirect_uri:
                       redirectUri,
+
                     code_verifier:
-                      state,
+                      codeVerifier,
                   }),
               },
             );
 
           if (!tokenResponse.ok) {
+            const body =
+              await tokenResponse.text();
+
+            console.error(
+              "X token error:",
+              body,
+            );
+
             throw new Error(
               "X token exchange failed.",
             );
@@ -525,7 +610,11 @@ export const socialOAuthCallback =
             );
           }
 
-          const userResponse =
+          // -----------------------------------------------
+          // GET AUTHENTICATED X USER
+          // -----------------------------------------------
+
+          const meResponse =
             await fetch(
               "https://api.x.com/2/users/me",
               {
@@ -536,14 +625,14 @@ export const socialOAuthCallback =
               },
             );
 
-          if (!userResponse.ok) {
+          if (!meResponse.ok) {
             throw new Error(
-              "X user verification failed.",
+              "X user lookup failed.",
             );
           }
 
-          const xUser =
-            await userResponse.json() as {
+          const me =
+            await meResponse.json() as {
               data?: {
                 id?: string;
                 username?: string;
@@ -551,7 +640,7 @@ export const socialOAuthCallback =
             };
 
           const xUserId =
-            xUser.data?.id;
+            me.data?.id;
 
           if (!xUserId) {
             throw new Error(
@@ -559,12 +648,10 @@ export const socialOAuthCallback =
             );
           }
 
-          /*
-           * Save only what is needed.
-           *
-           * DO NOT save the access token in a
-           * client-readable Firestore document.
-           */
+          // -----------------------------------------------
+          // STORE NON-SECRET ACCOUNT DATA
+          // -----------------------------------------------
+
           await db
             .collection("users")
             .doc(uid)
@@ -573,11 +660,16 @@ export const socialOAuthCallback =
             .set(
               {
                 platform: "x",
-                platformUserId: xUserId,
+
+                platformUserId:
+                  xUserId,
+
                 username:
-                  xUser.data?.username ||
+                  me.data?.username ||
                   null,
+
                 connected: true,
+
                 updatedAt:
                   admin.firestore.FieldValue
                     .serverTimestamp(),
@@ -587,19 +679,87 @@ export const socialOAuthCallback =
               },
             );
 
-          /*
-           * Token storage belongs in a protected
-           * server-side secret/token store.
-           *
-           * This function intentionally does not
-           * write the access token to normal user data.
-           */
+          // -----------------------------------------------
+          // VERIFY FOLLOW
+          // -----------------------------------------------
+
+          const configDoc =
+            await db
+              .collection("config")
+              .doc("socialTasks")
+              .get();
+
+          const xConfig =
+            configDoc.data()?.x;
+
+          const targetUserId =
+            xConfig?.targetUserId;
+
+          if (!targetUserId) {
+            throw new Error(
+              "X targetUserId is not configured.",
+            );
+          }
+
+          const followingUrl =
+            new URL(
+              `https://api.x.com/2/users/${encodeURIComponent(
+                xUserId,
+              )}/following`,
+            );
+
+          followingUrl.searchParams.set(
+            "max_results",
+            "1000",
+          );
+
+          const followingResponse =
+            await fetch(
+              followingUrl.toString(),
+              {
+                headers: {
+                  Authorization:
+                    `Bearer ${token.access_token}`,
+                },
+              },
+            );
+
+          if (!followingResponse.ok) {
+            throw new Error(
+              "X following verification failed.",
+            );
+          }
+
+          const following =
+            await followingResponse.json() as {
+              data?: Array<{
+                id?: string;
+              }>;
+            };
+
+          const followsUs =
+            (following.data || [])
+              .some(
+                (user) =>
+                  user.id ===
+                  targetUserId,
+              );
+
+          if (!followsUs) {
+            res
+              .status(400)
+              .send(
+                "X follow was not verified.",
+              );
+
+            return;
+          }
 
           await createSocialVerification(
             uid,
             taskId,
             "x",
-            xUserId,
+            targetUserId,
           );
         }
 
@@ -623,7 +783,7 @@ export const socialOAuthCallback =
             !redirectUri
           ) {
             throw new Error(
-              "TikTok OAuth configuration missing.",
+              "TikTok OAuth configuration is incomplete.",
             );
           }
 
@@ -632,19 +792,25 @@ export const socialOAuthCallback =
               "https://open.tiktokapis.com/v2/oauth/token/",
               {
                 method: "POST",
+
                 headers: {
                   "Content-Type":
                     "application/x-www-form-urlencoded",
                 },
+
                 body:
                   new URLSearchParams({
                     client_key:
                       clientKey,
+
                     client_secret:
                       clientSecret,
+
                     code,
+
                     grant_type:
                       "authorization_code",
+
                     redirect_uri:
                       redirectUri,
                   }),
@@ -652,6 +818,14 @@ export const socialOAuthCallback =
             );
 
           if (!tokenResponse.ok) {
+            const body =
+              await tokenResponse.text();
+
+            console.error(
+              "TikTok token error:",
+              body,
+            );
+
             throw new Error(
               "TikTok token exchange failed.",
             );
@@ -662,6 +836,7 @@ export const socialOAuthCallback =
               access_token?: string;
               open_id?: string;
               refresh_token?: string;
+              scope?: string;
             };
 
           if (
@@ -673,23 +848,7 @@ export const socialOAuthCallback =
             );
           }
 
-          const profileResponse =
-            await fetch(
-              "https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name,avatar_url",
-              {
-                headers: {
-                  Authorization:
-                    `Bearer ${token.access_token}`,
-                },
-              },
-            );
-
-          if (!profileResponse.ok) {
-            throw new Error(
-              "TikTok profile verification failed.",
-            );
-          }
-
+          // Save public account identity only.
           await db
             .collection("users")
             .doc(uid)
@@ -697,10 +856,18 @@ export const socialOAuthCallback =
             .doc("tiktok")
             .set(
               {
-                platform: "tiktok",
+                platform:
+                  "tiktok",
+
                 platformUserId:
                   token.open_id,
+
                 connected: true,
+
+                grantedScopes:
+                  token.scope ||
+                  null,
+
                 updatedAt:
                   admin.firestore.FieldValue
                     .serverTimestamp(),
@@ -713,11 +880,11 @@ export const socialOAuthCallback =
           /*
            * IMPORTANT:
            *
-           * Login success alone does NOT prove that
-           * the user followed our TikTok account.
+           * TikTok Login Kit proves authorization/login.
+           * It does NOT by itself prove the user followed
+           * Power Fan Network.
            *
-           * Therefore we do NOT grant the social
-           * follow reward here.
+           * Therefore NO reward is granted here.
            */
         }
 
@@ -741,7 +908,7 @@ export const socialOAuthCallback =
             !redirectUri
           ) {
             throw new Error(
-              "Google OAuth configuration missing.",
+              "Google OAuth configuration is incomplete.",
             );
           }
 
@@ -750,19 +917,25 @@ export const socialOAuthCallback =
               "https://oauth2.googleapis.com/token",
               {
                 method: "POST",
+
                 headers: {
                   "Content-Type":
                     "application/x-www-form-urlencoded",
                 },
+
                 body:
                   new URLSearchParams({
                     code,
+
                     client_id:
                       clientId,
+
                     client_secret:
                       clientSecret,
+
                     redirect_uri:
                       redirectUri,
+
                     grant_type:
                       "authorization_code",
                   }),
@@ -778,7 +951,6 @@ export const socialOAuthCallback =
           const token =
             await tokenResponse.json() as {
               access_token?: string;
-              refresh_token?: string;
             };
 
           if (!token.access_token) {
@@ -787,13 +959,9 @@ export const socialOAuthCallback =
             );
           }
 
-          /*
-           * Read authenticated user's subscriptions.
-           *
-           * The target channel ID must come from:
-           *
-           * /config/socialTasks
-           */
+          // -----------------------------------------------
+          // TARGET CHANNEL
+          // -----------------------------------------------
 
           const configDoc =
             await db
@@ -809,9 +977,13 @@ export const socialOAuthCallback =
 
           if (!targetChannelId) {
             throw new Error(
-              "YouTube target channel is not configured.",
+              "YouTube targetChannelId is not configured.",
             );
           }
+
+          // -----------------------------------------------
+          // CHECK SUBSCRIPTION
+          // -----------------------------------------------
 
           const subscriptionsUrl =
             new URL(
@@ -846,7 +1018,7 @@ export const socialOAuthCallback =
 
           if (!subscriptionResponse.ok) {
             throw new Error(
-              "YouTube subscription verification failed.",
+              "YouTube subscription API failed.",
             );
           }
 
@@ -872,9 +1044,13 @@ export const socialOAuthCallback =
               );
 
           if (!subscribed) {
-            throw new Error(
-              "YouTube subscription not verified.",
-            );
+            res
+              .status(400)
+              .send(
+                "YouTube subscription was not verified.",
+              );
+
+            return;
           }
 
           await createSocialVerification(
@@ -886,24 +1062,26 @@ export const socialOAuthCallback =
         }
 
         // ====================================================
-        // META
-        // ====================================================
-        //
-        // OAuth connection is recorded, but we do not claim
-        // that OAuth itself proves the user followed a Page
-        // or Instagram account.
+        // FACEBOOK / INSTAGRAM
         // ====================================================
 
         if (
-          platform === "instagram" ||
-          platform === "facebook"
+          platform === "facebook" ||
+          platform === "instagram"
         ) {
           /*
-           * The exact Meta API product and permissions must
-           * match the capabilities approved for your Meta app.
+           * OAuth authorization alone is NOT considered
+           * proof that the user followed/liked the Power Fan
+           * Network account.
            *
-           * Do NOT automatically create VERIFIED here.
+           * We record the connection only.
+           *
+           * Reward remains UNVERIFIED.
+           *
+           * This prevents fake rewards caused by treating
+           * login as follow verification.
            */
+
           await db
             .collection("users")
             .doc(uid)
@@ -912,7 +1090,9 @@ export const socialOAuthCallback =
             .set(
               {
                 platform,
+
                 connected: true,
+
                 oauthReceivedAt:
                   admin.firestore.FieldValue
                     .serverTimestamp(),
@@ -926,7 +1106,7 @@ export const socialOAuthCallback =
         res
           .status(200)
           .send(
-            "Social account authorization completed. Return to the app.",
+            "Social authorization completed.",
           );
       } catch (error) {
         console.error(
@@ -944,11 +1124,11 @@ export const socialOAuthCallback =
   );
 
 // ============================================================
-// 11. CREATE VERIFIED SOCIAL RECORD
+// 10. CREATE VERIFIED SOCIAL RECORD
 // ============================================================
 //
 // ONLY trusted backend code calls this.
-// Flutter cannot call this directly.
+// Flutter cannot call it.
 // ============================================================
 
 async function createSocialVerification(
@@ -957,28 +1137,18 @@ async function createSocialVerification(
   platform: SocialPlatform,
   evidenceId: string,
 ): Promise<void> {
-  const userRef =
-    db.collection("users").doc(uid);
-
-  const verificationRef =
-    userRef
-      .collection("taskVerifications")
-      .doc(taskId);
-
   const configDoc =
     await db
       .collection("config")
       .doc("socialTasks")
       .get();
 
-  const taskConfig =
-    configDoc
-      .data()
-      ?.[platform];
+  const platformConfig =
+    configDoc.data()?.[platform];
 
   const rewardAmount =
     Number(
-      taskConfig?.reward || 0,
+      platformConfig?.reward || 0,
     );
 
   if (
@@ -990,6 +1160,27 @@ async function createSocialVerification(
     throw new Error(
       "Invalid social reward configuration.",
     );
+  }
+
+  const userRef =
+    db
+      .collection("users")
+      .doc(uid);
+
+  const verificationRef =
+    userRef
+      .collection("taskVerifications")
+      .doc(taskId);
+
+  const existing =
+    await verificationRef.get();
+
+  if (
+    existing.exists &&
+    existing.data()?.status ===
+      "VERIFIED"
+  ) {
+    return;
   }
 
   const verificationId =
@@ -1021,21 +1212,18 @@ async function createSocialVerification(
             10 * 60 * 1000,
         ),
     },
+    {
+      merge: true,
+    },
   );
 }
 
 // ============================================================
-// 12. TELEGRAM VERIFICATION
+// 11. TELEGRAM MEMBERSHIP VERIFICATION
 // ============================================================
 //
-// Telegram verification uses the Telegram Bot API.
-// The bot must be an administrator in the target channel/group
-// when the API requires administrator-level access.
-//
-// Client supplies a Telegram username/user ID.
-// Backend asks Telegram for the member status.
-//
-// NEVER trust the client saying "I joined".
+// Telegram Bot API verifies actual membership.
+// The client cannot mark itself as verified.
 // ============================================================
 
 export const verifyTelegramMembership =
@@ -1093,37 +1281,43 @@ export const verifyTelegramMembership =
       if (!chatId) {
         throw new functions.https.HttpsError(
           "failed-precondition",
-          "Telegram chat ID is not configured.",
+          "Telegram chatId is not configured.",
         );
       }
 
-      const url =
-        `https://api.telegram.org/bot${botToken}/getChatMember`;
-
       const response =
-        await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type":
-              "application/json",
+        await fetch(
+          `https://api.telegram.org/bot${botToken}/getChatMember`,
+          {
+            method: "POST",
+
+            headers: {
+              "Content-Type":
+                "application/json",
+            },
+
+            body:
+              JSON.stringify({
+                chat_id:
+                  chatId,
+
+                user_id:
+                  telegramUserId,
+              }),
           },
-          body: JSON.stringify({
-            chat_id: chatId,
-            user_id:
-              telegramUserId,
-          }),
-        });
+        );
 
       if (!response.ok) {
         throw new functions.https.HttpsError(
           "unavailable",
-          "Telegram verification request failed.",
+          "Telegram API request failed.",
         );
       }
 
       const result =
         await response.json() as {
           ok?: boolean;
+
           result?: {
             status?: string;
           };
@@ -1136,13 +1330,13 @@ export const verifyTelegramMembership =
         );
       }
 
-      const memberStatus =
+      const status =
         result.result?.status;
 
       const isMember =
-        memberStatus === "member" ||
-        memberStatus === "administrator" ||
-        memberStatus === "creator";
+        status === "member" ||
+        status === "administrator" ||
+        status === "creator";
 
       if (!isMember) {
         throw new functions.https.HttpsError(
@@ -1159,8 +1353,12 @@ export const verifyTelegramMembership =
       );
 
       return {
-        status: "VERIFIED",
-        platform: "telegram",
+        status:
+          "VERIFIED",
+
+        platform:
+          "telegram",
+
         taskId,
       };
     });

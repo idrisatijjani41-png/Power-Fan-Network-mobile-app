@@ -1,0 +1,12 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+# NOTE: google-services.json is ignored here to keep public repositories secure.
+# If building via GitHub Actions, pass this file via Base64 secrets at build time.
+app/google-services.json

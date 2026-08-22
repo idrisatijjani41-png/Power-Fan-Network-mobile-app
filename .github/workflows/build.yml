@@ -29,23 +29,13 @@ jobs:
       - name: Get Dependencies
         run: flutter pub get
 
-      - name: Inject Gradle Wrapper Jar Direct
+      - name: Build APK with System Gradle
         run: |
-          mkdir -p android/gradle/wrapper
-          curl -sL https://raw.githubusercontent.com/gradle/gradle/v8.0.2/gradle/wrapper/gradle-wrapper.jar -o android/gradle/wrapper/gradle-wrapper.jar
-          cat << 'EOF' > android/gradle/wrapper/gradle-wrapper.properties
-          distributionBase=GRADLE_USER_HOME
-          distributionPath=wrapper/dists
-          distributionUrl=https\://services.gradle.org/distributions/gradle-8.0.2-bin.zip
-          zipStoreBase=GRADLE_USER_HOME
-          zipStorePath=wrapper/dists
-          EOF
-
-      - name: Build Android APK
-        run: flutter build apk --release --android-skip-build-dependency-validation
+          cd android
+          gradle assembleRelease -x test --stacktrace
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: release-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: android/app/build/outputs/apk/release/app-release.apk

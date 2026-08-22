@@ -20,27 +20,20 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Gradle 8.14
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.14'
-
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: 'stable'
+          flutter-version: '3.19.6'
           cache: true
 
       - name: Get Dependencies
         run: flutter pub get
 
-      - name: Build APK with System Gradle
-        run: |
-          cd android
-          gradle assembleRelease -x test -Porg.gradle.project.android.skipBuildDependencyValidation=true
+      - name: Build Android APK
+        run: flutter build apk --release
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: release-apk
-          path: android/app/build/outputs/apk/release/app-release.apk
+          path: build/app/outputs/flutter-apk/app-release.apk

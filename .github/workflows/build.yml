@@ -26,41 +26,13 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Auto-Migrate Android Embedding v2 & Clean Manifest
+      - name: Auto-Fix Android Embedding v2
         run: |
-          # 1. Inject Android Embedding v2 into AndroidManifest.xml if missing
           MANIFEST_FILE="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST_FILE" ]; then
             if ! grep -q "flutterEmbedding" "$MANIFEST_FILE"; then
               sed -i '/<application/a \        <meta-data android:name="flutterEmbedding" android:value="2" />' "$MANIFEST_FILE"
             fi
-          fi
-
-          # 2. Fix MainActivity to use FlutterActivity (Embedding v2)
-          KT_FILE=$(find android/app/src/main/kotlin android/app/src/main/java -name "MainActivity.kt" 2>/dev/null | head -n 1)
-          if [ -n "$KT_FILE" ]; then
-            PACKAGE_NAME=$(grep "^package " "$KT_FILE" | head -n 1)
-            cat <<EOF > "$KT_FILE"
-$PACKAGE_NAME
-
-import io.flutter.embedding.android.FlutterActivity
-
-class MainActivity: FlutterActivity() {
-}
-EOF
-          fi
-
-          JAVA_FILE=$(find android/app/src/main/java -name "MainActivity.java" 2>/dev/null | head -n 1)
-          if [ -n "$JAVA_FILE" ]; then
-            PACKAGE_NAME=$(grep "^package " "$JAVA_FILE" | head -n 1)
-            cat <<EOF > "$JAVA_FILE"
-$PACKAGE_NAME
-
-import io.flutter.embedding.android.FlutterActivity;
-
-public class MainActivity extends FlutterActivity {
-}
-EOF
           fi
 
       - name: Get Dependencies

@@ -38,6 +38,11 @@ jobs:
       - name: Get Dependencies
         run: flutter pub get
 
+      - name: Generate Missing Gradle Wrapper
+        run: |
+          cd android
+          gradle wrapper
+
       - name: Build Android APK
         run: flutter build apk --release --android-skip-build-dependency-validation
 

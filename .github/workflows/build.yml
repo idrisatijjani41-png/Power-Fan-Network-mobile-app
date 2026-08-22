@@ -26,22 +26,21 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Auto-Fix Android Embedding v2
+      - name: Fix Google Services Repository
         run: |
-          MANIFEST_FILE="android/app/src/main/AndroidManifest.xml"
-          if [ -f "$MANIFEST_FILE" ]; then
-            if ! grep -q "flutterEmbedding" "$MANIFEST_FILE"; then
-              sed -i '/<application/a \        <meta-data android:name="flutterEmbedding" android:value="2" />' "$MANIFEST_FILE"
+          SETTINGS_FILE="android/settings.gradle.kts"
+          if [ ! -f "$SETTINGS_FILE" ]; then
+            SETTINGS_FILE="android/settings.gradle"
+          fi
+
+          if [ -f "$SETTINGS_FILE" ]; then
+            if ! grep -q "google()" "$SETTINGS_FILE"; then
+              echo 'pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }' | cat - "$SETTINGS_FILE" > temp && mv temp "$SETTINGS_FILE"
             fi
           fi
 
       - name: Get Dependencies
         run: flutter pub get
-
-      - name: Generate Missing Gradle Wrapper
-        run: |
-          cd android
-          gradle wrapper
 
       - name: Build Android APK
         run: flutter build apk --release --android-skip-build-dependency-validation

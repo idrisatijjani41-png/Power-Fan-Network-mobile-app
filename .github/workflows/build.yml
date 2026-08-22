@@ -29,15 +29,7 @@ jobs:
       - name: Get Dependencies
         run: flutter pub get
 
-      - name: Fix Missing Gradle Wrapper
-        run: |
-          cd android
-          gradle wrapper --gradle-version 8.0
-
-      - name: Make Gradlew Executable
-        run: chmod +x android/gradlew
-
-      - name: Build Android APK
+      - name: Build Android APK Direct
         run: flutter build apk --release --android-skip-build-dependency-validation
 
       - name: Upload APK Artifact
